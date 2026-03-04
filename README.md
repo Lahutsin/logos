@@ -150,9 +150,7 @@ Tokens must be supplied in `auth` when auth is enabled. With `RK_REQUIRE_AUTH=tr
 See [src/sdk.rs](src/sdk.rs) for an async client that performs handshake, produce, and fetch with optional auth tokens. For TLS, configure the connector with your CA and SNI domain.
 
 ## Next steps
-- Dynamic metadata service with leader election and fencing.
-- Streaming compaction and tombstone retention policies.
-- Benchmarks under realistic backpressure.
+- Depends on requrements... and testing
 
 ## License
 Source-available: free for evaluation and non-commercial use. Commercial use requires a paid license; contact the maintainers to obtain terms.
