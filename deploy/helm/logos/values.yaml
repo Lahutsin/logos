@@ -1,0 +1,72 @@
+replicaCount: 1
+
+image:
+  repository: logos
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 9092
+  adminPort: 9100
+
+resources: {}
+
+nodeSelector: {}
+
+affinity: {}
+
+tolerations: []
+
+persistence:
+  enabled: false
+  storageClass: ""
+  size: 5Gi
+
+env:
+  bindAddr: "0.0.0.0:9092"
+  adminAddr: "0.0.0.0:9100"
+  dataDir: "/var/lib/logos"
+  segmentBytes: 134217728
+  maxConnections: 512
+  replicationAcks: 1
+  replicationTimeoutMs: 1000
+  replicationRetries: 2
+  replicationBackoffMs: 200
+  metadataPath: ""
+  metadataRefreshMs: 1000
+  retentionBytes: ""
+  retentionSegments: ""
+  indexStride: 16
+  fsync: "true"
+  replicationToken: ""
+  authPath: ""
+  tlsCert: ""
+  tlsKey: ""
+  tlsCa: ""
+  tlsClientCa: ""
+  tlsDomain: ""
+  requireTls: false
+  requireAuth: true
+  adminToken: ""
+
+auth:
+  secretName: "logos-auth"
+  secretKey: "auth.json"
+  mountPath: "/var/run/logos/authz"
+
+replicationTokenSecret:
+  name: ""
+  key: "token"
+
+productionProfile:
+  enabled: false
+
+networkPolicy:
+  enabled: false
+  ingressCIDRs:
+    - "10.0.0.0/8"
+    - "192.168.0.0/16"
+    - "172.16.0.0/12"
+
+extraEnv: []

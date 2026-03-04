@@ -1,0 +1,161 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "logos.fullname" . }}
+  labels:
+    app: {{ include "logos.name" . }}
+    chart: {{ include "logos.chart" . }}
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ include "logos.name" . }}
+      release: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "logos.name" . }}
+        release: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: logos
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- $prod := .Values.productionProfile.enabled }}
+          {{- $persistenceEnabled := or $prod .Values.persistence.enabled }}
+          {{- $requireTls := or $prod .Values.env.requireTls }}
+          {{- $requireAuth := or $prod .Values.env.requireAuth }}
+          {{- $authPath := (default (printf "%s/%s" .Values.auth.mountPath .Values.auth.secretKey) .Values.env.authPath) }}
+          env:
+            - name: RK_BIND_ADDR
+              value: {{ .Values.env.bindAddr | quote }}
+            - name: RK_ADMIN_ADDR
+              value: {{ .Values.env.adminAddr | quote }}
+            - name: RK_DATA_DIR
+              value: {{ .Values.env.dataDir | quote }}
+            - name: RK_SEGMENT_BYTES
+              value: {{ .Values.env.segmentBytes | quote }}
+            - name: RK_MAX_CONNECTIONS
+              value: {{ .Values.env.maxConnections | quote }}
+            - name: RK_REPLICATION_ACKS
+              value: {{ .Values.env.replicationAcks | quote }}
+            - name: RK_REPLICATION_TIMEOUT_MS
+              value: {{ .Values.env.replicationTimeoutMs | quote }}
+            - name: RK_REPLICATION_RETRIES
+              value: {{ .Values.env.replicationRetries | quote }}
+            - name: RK_REPLICATION_BACKOFF_MS
+              value: {{ .Values.env.replicationBackoffMs | quote }}
+            - name: RK_METADATA_PATH
+              value: {{ .Values.env.metadataPath | quote }}
+            - name: RK_METADATA_REFRESH_MS
+              value: {{ .Values.env.metadataRefreshMs | quote }}
+            - name: RK_RETENTION_BYTES
+              value: {{ .Values.env.retentionBytes | quote }}
+            - name: RK_RETENTION_SEGMENTS
+              value: {{ .Values.env.retentionSegments | quote }}
+            - name: RK_INDEX_STRIDE
+              value: {{ .Values.env.indexStride | quote }}
+            - name: RK_FSYNC
+              value: {{ .Values.env.fsync | quote }}
+            - name: RK_REPLICATION_TOKEN
+              {{- if .Values.replicationTokenSecret.name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.replicationTokenSecret.name }}
+                  key: {{ .Values.replicationTokenSecret.key }}
+              {{- else }}
+              value: {{ .Values.env.replicationToken | quote }}
+              {{- end }}
+            - name: RK_AUTH_PATH
+              value: {{ $authPath | quote }}
+            - name: RK_TLS_CERT
+              value: {{ .Values.env.tlsCert | quote }}
+            - name: RK_TLS_KEY
+              value: {{ .Values.env.tlsKey | quote }}
+            - name: RK_TLS_CA
+              value: {{ .Values.env.tlsCa | quote }}
+            - name: RK_TLS_CLIENT_CA
+              value: {{ .Values.env.tlsClientCa | quote }}
+            - name: RK_TLS_DOMAIN
+              value: {{ .Values.env.tlsDomain | quote }}
+            - name: RK_REQUIRE_TLS
+              value: {{ $requireTls | quote }}
+            - name: RK_REQUIRE_AUTH
+              value: {{ $requireAuth | quote }}
+            - name: RK_ADMIN_TOKEN
+              value: {{ .Values.env.adminToken | quote }}
+            {{- range .Values.extraEnv }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+            {{- end }}
+          ports:
+            - name: client
+              containerPort: {{ .Values.service.port }}
+            - name: admin
+              containerPort: {{ .Values.service.adminPort }}
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: admin
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: admin
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.env.dataDir }}
+            {{- if .Values.auth.secretName }}
+            - name: authz
+              mountPath: {{ .Values.auth.mountPath }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: data
+          {{- if $persistenceEnabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "logos.fullname" . }}-data
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if .Values.auth.secretName }}
+        - name: authz
+          secret:
+            secretName: {{ .Values.auth.secretName }}
+            items:
+              - key: {{ .Values.auth.secretKey }}
+                path: {{ .Values.auth.secretKey }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+{{- if or .Values.productionProfile.enabled .Values.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "logos.fullname" . }}-data
+  labels:
+    app: {{ include "logos.name" . }}
+    release: {{ .Release.Name }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size }}
+  {{- if .Values.persistence.storageClass }}
+  storageClassName: {{ .Values.persistence.storageClass }}
+  {{- end }}
+{{- end }}
