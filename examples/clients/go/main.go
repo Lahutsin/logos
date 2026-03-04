@@ -1,21 +1,18 @@
 package main
 
 import (
+    "bytes"
     "encoding/binary"
     "fmt"
     "io"
     "net"
     "os"
-    "path/filepath"
 )
 
-func load(rel string) ([]byte, error) {
-    root, err := os.Getwd()
-    if err != nil {
-        return nil, err
-    }
-    path := filepath.Join(root, "tests", "fixtures", "v1", rel)
-    return os.ReadFile(path)
+type record struct {
+    key       []byte
+    value     []byte
+    timestamp int64
 }
 
 func sendFrame(conn net.Conn, payload []byte) error {
@@ -43,6 +40,45 @@ func recvFrame(conn net.Conn) ([]byte, error) {
     return buf, nil
 }
 
+func writeString(buf *bytes.Buffer, s string) {
+    b := []byte(s)
+    binary.Write(buf, binary.LittleEndian, uint64(len(b)))
+    buf.Write(b)
+}
+
+func buildHandshake(clientVersion uint16) []byte {
+    var buf bytes.Buffer
+    binary.Write(&buf, binary.LittleEndian, uint32(4)) // variant index for Handshake
+    binary.Write(&buf, binary.LittleEndian, clientVersion)
+    return buf.Bytes()
+}
+
+func buildProduce(topic string, partition uint32, records []record, auth *string) []byte {
+    var buf bytes.Buffer
+    binary.Write(&buf, binary.LittleEndian, uint32(0)) // variant index for Produce
+
+    writeString(&buf, topic)
+    binary.Write(&buf, binary.LittleEndian, partition)
+
+    binary.Write(&buf, binary.LittleEndian, uint64(len(records)))
+    for _, r := range records {
+        binary.Write(&buf, binary.LittleEndian, uint64(len(r.key)))
+        buf.Write(r.key)
+        binary.Write(&buf, binary.LittleEndian, uint64(len(r.value)))
+        buf.Write(r.value)
+        binary.Write(&buf, binary.LittleEndian, r.timestamp)
+    }
+
+    if auth == nil {
+        buf.WriteByte(0) // Option::None
+    } else {
+        buf.WriteByte(1) // Option::Some
+        writeString(&buf, *auth)
+    }
+
+    return buf.Bytes()
+}
+
 func main() {
     host := os.Getenv("LOGOS_HOST")
     if host == "" {
@@ -59,10 +95,7 @@ func main() {
     }
     defer conn.Close()
 
-    handshake, err := load("handshake_req.bin")
-    if err != nil {
-        panic(err)
-    }
+    handshake := buildHandshake(1)
     if err := sendFrame(conn, handshake); err != nil {
         panic(err)
     }
@@ -72,10 +105,11 @@ func main() {
     }
     fmt.Printf("handshake resp=%x\n", hsResp)
 
-    produce, err := load("produce_req.bin")
-    if err != nil {
-        panic(err)
-    }
+    auth := "token-a"
+    produce := buildProduce("compat", 0, []record{
+        {key: []byte("k1"), value: []byte("v1"), timestamp: 1},
+        {key: []byte("k2"), value: []byte("v2"), timestamp: 2},
+    }, &auth)
     if err := sendFrame(conn, produce); err != nil {
         panic(err)
     }

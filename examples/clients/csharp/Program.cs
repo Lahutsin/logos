@@ -5,7 +5,64 @@ using System.Buffers.Binary;
 
 class Program
 {
-    static byte[] Load(string rel) => File.ReadAllBytes(Path.Combine("tests/fixtures/v1", rel));
+    // Minimal bincode-compatible encoders for handshake and produce so payloads can be built in code.
+    static byte[] BuildHandshakePayload(ushort clientVersion = 1)
+    {
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms);
+        bw.Write((uint)4); // Request::Handshake variant index
+        bw.Write(clientVersion);
+        bw.Flush();
+        return ms.ToArray();
+    }
+
+    static byte[] BuildProducePayload(
+        string topic,
+        uint partition,
+        (byte[] key, byte[] value, long timestamp)[] records,
+        string? authToken)
+    {
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms);
+
+        // Request::Produce variant index (see protocol.rs order)
+        bw.Write((uint)0);
+
+        // topic: String (u64 len + bytes)
+        var topicBytes = System.Text.Encoding.UTF8.GetBytes(topic);
+        bw.Write((ulong)topicBytes.Length);
+        bw.Write(topicBytes);
+
+        // partition: u32
+        bw.Write(partition);
+
+        // records: Vec<Record>
+        bw.Write((ulong)records.Length);
+        foreach (var r in records)
+        {
+            bw.Write((ulong)r.key.Length);
+            bw.Write(r.key);
+            bw.Write((ulong)r.value.Length);
+            bw.Write(r.value);
+            bw.Write(r.timestamp);
+        }
+
+        // auth: Option<String> (u8 tag then string if Some)
+        if (authToken is null)
+        {
+            bw.Write((byte)0); // None
+        }
+        else
+        {
+            bw.Write((byte)1); // Some
+            var authBytes = System.Text.Encoding.UTF8.GetBytes(authToken);
+            bw.Write((ulong)authBytes.Length);
+            bw.Write(authBytes);
+        }
+
+        bw.Flush();
+        return ms.ToArray();
+    }
 
     static void SendFrame(NetworkStream stream, byte[] payload)
     {
@@ -40,11 +97,23 @@ class Program
         using var client = new TcpClient(host, port);
         using var stream = client.GetStream();
 
-        SendFrame(stream, Load("handshake_req.bin"));
+        // Build handshake request directly in code.
+        var hsPayload = BuildHandshakePayload();
+        SendFrame(stream, hsPayload);
         var hs = RecvFrame(stream);
         Console.WriteLine("handshake resp=" + Convert.ToHexString(hs));
 
-        SendFrame(stream, Load("produce_req.bin"));
+        // Build a Produce request: topic "compat", partition 0, two records, auth token "token-a".
+        var prodPayload = BuildProducePayload(
+            topic: "compat",
+            partition: 0,
+            records: new[]
+            {
+                (key: new byte[] {(byte)'k', (byte)'1'}, value: new byte[] {(byte)'v', (byte)'1'}, timestamp: 1L),
+                (key: new byte[] {(byte)'k', (byte)'2'}, value: new byte[] {(byte)'v', (byte)'2'}, timestamp: 2L),
+            },
+            authToken: "token-a");
+        SendFrame(stream, prodPayload);
         var prod = RecvFrame(stream);
         Console.WriteLine("produce resp=" + Convert.ToHexString(prod));
     }
