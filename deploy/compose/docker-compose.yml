@@ -1,0 +1,70 @@
+version: "3.9"
+
+x-logos-env: &logos-env
+  RK_BIND_ADDR: 0.0.0.0:9092
+  RK_ADMIN_ADDR: 0.0.0.0:9100
+  RK_METADATA_PATH: /etc/logos/metadata.json
+  RK_REQUIRE_AUTH: "false"
+  RK_REQUIRE_TLS: "false"
+  RK_REPLICATION_ACKS: 2
+
+services:
+  node-a:
+    image: logos:local
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      <<: *logos-env
+      RK_NODE_ID: node-a
+    volumes:
+      - ./metadata.json:/etc/logos/metadata.json:ro
+      - node-a-data:/var/lib/logos
+    ports:
+      - "9092:9092"
+      - "9100:9100"
+    networks:
+      - logos-net
+
+  node-b:
+    image: logos:local
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      <<: *logos-env
+      RK_NODE_ID: node-b
+    volumes:
+      - ./metadata.json:/etc/logos/metadata.json:ro
+      - node-b-data:/var/lib/logos
+    ports:
+      - "9093:9092"
+      - "9101:9100"
+    networks:
+      - logos-net
+
+  node-c:
+    image: logos:local
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      <<: *logos-env
+      RK_NODE_ID: node-c
+    volumes:
+      - ./metadata.json:/etc/logos/metadata.json:ro
+      - node-c-data:/var/lib/logos
+    ports:
+      - "9094:9092"
+      - "9102:9100"
+    networks:
+      - logos-net
+
+networks:
+  logos-net:
+    driver: bridge
+
+volumes:
+  node-a-data:
+  node-b-data:
+  node-c-data:

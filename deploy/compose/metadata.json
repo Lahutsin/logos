@@ -1,0 +1,14 @@
+{
+  "nodes": {
+    "node-a": "node-a:9092",
+    "node-b": "node-b:9092",
+    "node-c": "node-c:9092"
+  },
+  "topics": {
+    "demo": {
+      "0": { "leader": "node-a", "followers": ["node-b", "node-c"], "epoch": 1 },
+      "1": { "leader": "node-b", "followers": ["node-a", "node-c"], "epoch": 1 },
+      "2": { "leader": "node-c", "followers": ["node-a", "node-b"], "epoch": 1 }
+    }
+  }
+}
