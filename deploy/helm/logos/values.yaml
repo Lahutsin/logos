@@ -18,6 +18,11 @@ affinity: {}
 
 tolerations: []
 
+scheduling:
+  spreadAcrossNodes: true
+  spreadMode: required
+  topologyKey: kubernetes.io/hostname
+
 persistence:
   enabled: false
   storageClass: ""
