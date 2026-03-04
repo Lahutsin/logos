@@ -1,15 +1,20 @@
 Logos protocol quickstart (non-Rust clients)
 ============================================
 
-These examples demonstrate a minimal TCP client for Logos using frozen binary frames (bincode) from `tests/fixtures/v1`. They do not build requests dynamically: each program reads a prepared payload and wraps it with a length prefix (u32 big-endian) as required by the protocol.
+These examples build the handshake and produce requests in code using `bincode`-compatible encoders and wrap them with a u32 big-endian length prefix (the broker framing). Each client prints the raw responses in hex.
 
-Important: the frames do not include `auth`, so run the broker with auth/TLS disabled for the demo (`RK_REQUIRE_AUTH=false RK_REQUIRE_TLS=false`). Do not point these fixtures at production clusters; use an SDK/client that sets auth tokens and TLS for production.
+Flow
+- Send `Handshake { client_version: 1 }` → read response.
+- Send `Produce { topic: "compat", partition: 0, records: [(k1,v1,ts=1), (k2,v2,ts=2)], auth: token-a }` → read response.
+- Override host/port with `LOGOS_HOST` / `LOGOS_PORT` (defaults `127.0.0.1:9092`).
 
-Flow: send handshake → read response → send `produce_req.bin` → read `produced_resp.bin`.
-
-Frame files:
-- `tests/fixtures/v1/handshake_req.bin`
-- `tests/fixtures/v1/produce_req.bin` (topic `compat`, partition 0, two records)
+Broker setup
+- Quick demo (auth/TLS off): `RK_REQUIRE_AUTH=false RK_REQUIRE_TLS=false cargo run --release`
+- With auth on (default): create `auth.json` like:
+	```json
+	{"token-a": {"name": "demo-writer", "topics": ["compat"], "allow_produce": true}}
+	```
+	then run `RK_AUTH_PATH=./auth.json cargo run --release` so `token-a` can produce.
 
 Java
 ----
@@ -45,6 +50,5 @@ go run ./examples/clients/go
 ```
 
 Notes
-- The examples read and print responses in hex without decoding bincode.
-- Address/port can be overridden via `LOGOS_HOST` and `LOGOS_PORT` env vars.
-- To generate requests dynamically in other languages, implement bincode (or bridge through a small Rust gRPC/HTTP proxy over the SDK). For brokers with TLS/Auth enabled, use an SDK/client that handles tokens and TLS.
+- These clients construct payloads directly; protocol fixtures remain under [tests/fixtures/v1](tests/fixtures/v1) for compatibility tests and for regenerating via `cargo run --quiet --example gen_fixtures`.
+- For production, use an SDK that manages auth tokens and TLS instead of these minimal examples.
