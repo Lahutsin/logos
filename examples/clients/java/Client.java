@@ -52,6 +52,10 @@ public class Client {
     }
 
     private static byte[] buildProduce(String topic, int partition, List<Rec> records, String auth) {
+        if (records.isEmpty()) {
+            throw new IllegalArgumentException("records must be non-empty");
+        }
+
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         writeU32LE(out, 0); // variant index for Produce
 

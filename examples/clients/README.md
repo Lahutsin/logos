@@ -6,6 +6,7 @@ These examples build the handshake and produce requests in code using `bincode`-
 Flow
 - Send `Handshake { client_version: 1 }` → read response.
 - Send `Produce { topic: "compat", partition: 0, records: [(k1,v1,ts=1), (k2,v2,ts=2)], auth: token-a }` → read response.
+	- `records` must be non-empty; the broker rejects empty produce batches.
 - Override host/port with `LOGOS_HOST` / `LOGOS_PORT` (defaults `127.0.0.1:9092`).
 
 Broker setup

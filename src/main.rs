@@ -264,7 +264,11 @@ where
             Ok(req) => req,
             Err(err) => {
                 warn!(%err, "failed to decode request");
-                continue;
+                let response = Response::Error("invalid request frame".to_string());
+                if let Ok(encoded) = protocol::encode(&response) {
+                    let _ = framed.send(Bytes::from(encoded)).await;
+                }
+                break;
             }
         };
 

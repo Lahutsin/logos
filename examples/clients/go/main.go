@@ -54,6 +54,10 @@ func buildHandshake(clientVersion uint16) []byte {
 }
 
 func buildProduce(topic string, partition uint32, records []record, auth *string) []byte {
+    if len(records) == 0 {
+        panic("records must be non-empty")
+    }
+
     var buf bytes.Buffer
     binary.Write(&buf, binary.LittleEndian, uint32(0)) // variant index for Produce
 

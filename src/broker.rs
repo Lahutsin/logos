@@ -60,6 +60,11 @@ impl Broker {
     }
 
     async fn handle_produce(&self, req: ProduceRequest) -> Response {
+        if req.records.is_empty() {
+            inc_request("produce", "empty");
+            return Response::Error("empty produce batch".to_string());
+        }
+
         let produce_bytes: u64 = req
             .records
             .iter()
@@ -266,6 +271,45 @@ impl Broker {
                 inc_request("fetch", "error");
                 Response::Error(err.to_string())
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metadata::Metadata;
+    use crate::protocol::{ProduceRequest, Request};
+    use crate::replication::Replicator;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn produce_rejects_empty_batch() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path(), 1024 * 1024, None, None, 16, false).unwrap();
+        let metadata = Arc::new(Metadata::single_node("node-1".to_string()));
+        let authz = Authz::load(None).unwrap();
+        let broker = Broker::new(
+            storage,
+            Replicator::disabled(),
+            metadata,
+            1,
+            authz,
+            4 * 1024 * 1024,
+        );
+
+        let response = broker
+            .handle(Request::Produce(ProduceRequest {
+                topic: "topic".to_string(),
+                partition: 0,
+                records: Vec::new(),
+                auth: None,
+            }))
+            .await;
+
+        match response {
+            Response::Error(msg) => assert!(msg.contains("empty produce batch")),
+            other => panic!("expected error response, got {other:?}"),
         }
     }
 }

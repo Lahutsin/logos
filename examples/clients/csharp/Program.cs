@@ -22,6 +22,9 @@ class Program
         (byte[] key, byte[] value, long timestamp)[] records,
         string? authToken)
     {
+        if (records.Length == 0)
+            throw new ArgumentException("records must be non-empty", nameof(records));
+
         using var ms = new MemoryStream();
         using var bw = new BinaryWriter(ms);
 

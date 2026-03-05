@@ -18,8 +18,17 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]
     Serialization(#[from] bincode::Error),
+    #[error("invalid topic name: '{0}'")]
+    InvalidTopic(String),
     #[error("topic '{topic}' partition {partition} not found")]
     UnknownPartition { topic: String, partition: u32 },
+    #[error("record too large: frame {frame_bytes} bytes exceeds segment size {segment_bytes}")]
+    RecordTooLarge {
+        frame_bytes: u64,
+        segment_bytes: u64,
+    },
+    #[error("record payload too large to encode length field: {payload_bytes} bytes")]
+    RecordLengthOverflow { payload_bytes: usize },
     #[error("data corruption: {0}")]
     Corruption(String),
 }
@@ -147,6 +156,7 @@ impl Storage {
         partition: u32,
         records: Vec<Record>,
     ) -> StorageResult<(Offset, Offset)> {
+        Self::validate_topic_name(topic)?;
         let key = TopicPartition {
             topic: topic.to_string(),
             partition,
@@ -175,6 +185,7 @@ impl Storage {
         partition: u32,
         entries: Vec<(Offset, Record)>,
     ) -> StorageResult<(Offset, Offset)> {
+        Self::validate_topic_name(topic)?;
         let key = TopicPartition {
             topic: topic.to_string(),
             partition,
@@ -205,6 +216,7 @@ impl Storage {
         offset: Offset,
         max_bytes: u32,
     ) -> StorageResult<Vec<FetchedRecord>> {
+        Self::validate_topic_name(topic)?;
         let key = TopicPartition {
             topic: topic.to_string(),
             partition,
@@ -224,6 +236,7 @@ impl Storage {
     }
 
     pub fn compact(&self, topic: &str, partition: u32) -> StorageResult<()> {
+        Self::validate_topic_name(topic)?;
         let key = TopicPartition {
             topic: topic.to_string(),
             partition,
@@ -296,6 +309,18 @@ impl Storage {
                 partition: key.partition,
             })
     }
+
+    fn validate_topic_name(topic: &str) -> StorageResult<()> {
+        if topic.is_empty() || topic.contains('\0') || topic.contains('/') || topic.contains('\\') {
+            return Err(StorageError::InvalidTopic(topic.to_string()));
+        }
+
+        let mut components = Path::new(topic).components();
+        match (components.next(), components.next()) {
+            (Some(std::path::Component::Normal(_)), None) => Ok(()),
+            _ => Err(StorageError::InvalidTopic(topic.to_string())),
+        }
+    }
 }
 
 struct Log {
@@ -325,7 +350,9 @@ impl Log {
         let mut segments = discover_segments(&dir)?;
         segments.sort_by_key(|(base, _)| *base);
 
-        let committed = load_commit(&dir)?;
+        let commit_marker = load_commit(&dir)?;
+        let first_base = segments.first().map(|(base, _)| *base);
+        let scan_limit = commit_marker.and_then(|m| m.trusted.then_some(m.last_offset));
 
         if segments.is_empty() {
             return Self::create(
@@ -342,28 +369,42 @@ impl Log {
         let mut metas = Vec::new();
         for (base, path) in segments.iter() {
             let idx_path = index_path(path);
-            let scanned = scan_segment(path, *base, index_stride, committed)?;
-            let index = load_index(&idx_path)?.unwrap_or(scanned.index.clone());
-
-            if !idx_path.exists() {
-                write_index(&idx_path, &index)?;
-            }
+            let scanned = scan_segment(path, *base, index_stride, scan_limit)?;
+            // Rebuild index from scanned data to avoid stale/corrupt idx usage.
+            write_index(&idx_path, &scanned.index)?;
             metas.push(SegmentMeta {
                 path: path.clone(),
                 base_offset: *base,
                 last_offset: scanned.last_offset,
                 size: scanned.size,
-                index,
+                index: scanned.index,
             });
         }
 
-        let mut metas: Vec<SegmentMeta> = metas
-            .into_iter()
-            .filter(|m| committed.map(|c| m.base_offset <= c).unwrap_or(true))
+        let discovered_high = metas.iter().map(|m| m.last_offset).max();
+        let effective_commit = match (commit_marker, first_base, discovered_high) {
+            (Some(marker), Some(base), Some(high)) if marker.last_offset < base => None,
+            (Some(marker), Some(_base), Some(_high)) if marker.trusted => Some(marker.last_offset),
+            (Some(marker), Some(_base), Some(high)) => Some(marker.last_offset.min(high)),
+            _ => None,
+        };
+
+        let mut filtered: Vec<SegmentMeta> = metas
+            .iter()
+            .filter(|m| effective_commit.map(|c| m.base_offset <= c).unwrap_or(true))
+            .cloned()
             .collect();
 
-        let active_meta = metas.pop().expect("non-empty");
-        let sealed_bytes: u64 = metas.iter().map(|m| m.size).sum();
+        // If commit filtering removes everything, recover from discovered segments instead of
+        // panicking on an inconsistent commit marker.
+        if effective_commit.is_some() && filtered.is_empty() {
+            filtered = metas;
+        }
+
+        let active_meta = filtered
+            .pop()
+            .ok_or_else(|| StorageError::Corruption("no recoverable segments found".to_string()))?;
+        let sealed_bytes: u64 = filtered.iter().map(|m| m.size).sum();
         let commit_path = commit_path(&dir);
         let mut log = Self {
             dir,
@@ -374,7 +415,7 @@ impl Log {
             fsync,
             commit_path,
             active: Segment::recover(active_meta.clone(), index_stride)?,
-            sealed: metas,
+            sealed: filtered,
             sealed_bytes,
         };
 
@@ -383,7 +424,7 @@ impl Log {
         }
 
         // Ensure next_offset is at least committed+1 if commit exists.
-        if let Some(c) = committed {
+        if let Some(c) = effective_commit {
             log.active.next_offset = (c + 1).max(log.active.next_offset);
         }
 
@@ -459,6 +500,7 @@ impl Log {
         let batch_start = self.active.next_offset;
         for record in records {
             let payload = bincode::serialize(&record)?;
+            self.ensure_record_fits_segment(payload.len())?;
             if self
                 .active
                 .will_overflow(payload.len() as u64, self.segment_bytes)
@@ -481,22 +523,38 @@ impl Log {
     }
 
     fn fetch(&self, offset: Offset, max_bytes: u32) -> StorageResult<Vec<FetchedRecord>> {
+        if max_bytes == 0 {
+            return Ok(Vec::new());
+        }
+
         let mut out = Vec::new();
+        let mut remaining = max_bytes as u64;
+        let mut blocked_on_earliest = false;
 
         for segment in &self.sealed {
+            if remaining == 0 {
+                break;
+            }
             if segment.last_offset < offset {
                 continue;
             }
-            let records = segment.read_from(offset, max_bytes)?;
-            out.extend(records);
-            if over_budget(&out, max_bytes) {
-                return Ok(out);
+            let budget = remaining.min(u32::MAX as u64) as u32;
+            let records = segment.read_from(offset, budget)?;
+            if records.is_empty() {
+                // The next visible frame in this segment does not fit current budget.
+                // Stop here to avoid skipping to newer offsets in later segments.
+                blocked_on_earliest = true;
+                break;
             }
+            let consumed = fetched_records_frame_bytes(&records)?;
+            remaining = remaining.saturating_sub(consumed);
+            out.extend(records);
         }
 
         let active_meta = self.active.meta();
-        if active_meta.last_offset >= offset {
-            let records = self.active.read_from(offset, max_bytes)?;
+        if !blocked_on_earliest && remaining > 0 && active_meta.last_offset >= offset {
+            let budget = remaining.min(u32::MAX as u64) as u32;
+            let records = self.active.read_from(offset, budget)?;
             out.extend(records);
         }
 
@@ -526,6 +584,7 @@ impl Log {
                 )));
             }
             let payload = bincode::serialize(record)?;
+            self.ensure_record_fits_segment(payload.len())?;
             if self
                 .active
                 .will_overflow(payload.len() as u64, self.segment_bytes)
@@ -592,22 +651,9 @@ impl Log {
     }
 
     fn compact(&mut self) -> StorageResult<()> {
-        // Collect latest record per key.
-        let mut latest: HashMap<Vec<u8>, (Offset, Record)> = HashMap::new();
-
-        for segment in &self.sealed {
-            let records = segment.read_from(0, u32::MAX)?;
-            for r in records {
-                latest.insert(r.record.key.clone(), (r.offset, r.record));
-            }
-        }
-
-        {
-            let active_records = self.active.read_from(0, u32::MAX)?;
-            for r in active_records {
-                latest.insert(r.record.key.clone(), (r.offset, r.record));
-            }
-        }
+        // Collect latest record per key, scanning segments in chunks so compaction
+        // works even when a segment exceeds 4GiB.
+        let latest = self.collect_latest(u32::MAX)?;
 
         if latest.is_empty() {
             return Ok(());
@@ -619,11 +665,19 @@ impl Log {
         // Drop tombstones (empty value) entirely.
         compacted.retain(|(_, rec)| !rec.value.is_empty());
 
-        if compacted.is_empty() {
-            return Ok(());
-        }
+        let high_watermark_next = self.active.next_offset;
+        let high_watermark_last = high_watermark_next.saturating_sub(1);
 
-        let base = compacted.first().map(|(o, _)| *o).unwrap_or(0);
+        // Preserve original offsets of surviving records.
+        let base = if compacted.is_empty() {
+            high_watermark_next
+        } else {
+            compacted
+                .first()
+                .map(|(o, _)| *o)
+                .unwrap_or(high_watermark_next)
+        };
+
         let new_dir = self.dir.with_extension("compact");
         let _ = fs::remove_dir_all(&new_dir);
 
@@ -637,10 +691,23 @@ impl Log {
             self.fsync,
         )?;
 
-        new_log.append_with_offsets(&compacted)?;
-        new_log.apply_retention()?;
+        if !compacted.is_empty() {
+            new_log.append_sparse_with_offsets(&compacted)?;
+            new_log.apply_retention()?;
+        }
+
+        if high_watermark_next > 0 {
+            persist_commit(&new_log.commit_path, high_watermark_last)?;
+            new_log.active.next_offset = new_log.active.next_offset.max(high_watermark_next);
+        }
+
         sync_dir(&new_dir)?;
 
+        drop(new_log);
+        self.swap_partition_dirs(new_dir)
+    }
+
+    fn swap_partition_dirs(&mut self, new_dir: PathBuf) -> StorageResult<()> {
         let backup_dir = self.dir.with_extension("old");
         let _ = fs::remove_dir_all(&backup_dir);
         let parent_dir = self
@@ -680,6 +747,110 @@ impl Log {
         let _ = fs::remove_dir_all(&backup_dir);
         let _ = sync_dir(&parent_dir);
         Ok(())
+    }
+
+    fn ensure_record_fits_segment(&self, payload_len: usize) -> StorageResult<()> {
+        if payload_len > u32::MAX as usize {
+            return Err(StorageError::RecordLengthOverflow {
+                payload_bytes: payload_len,
+            });
+        }
+
+        let frame_bytes = frame_overhead().saturating_add(payload_len as u64);
+        if frame_bytes > self.segment_bytes {
+            return Err(StorageError::RecordTooLarge {
+                frame_bytes,
+                segment_bytes: self.segment_bytes,
+            });
+        }
+        Ok(())
+    }
+
+    fn append_sparse_with_offsets(&mut self, records: &[(Offset, Record)]) -> StorageResult<()> {
+        let mut prev = None;
+
+        for (offset, record) in records {
+            if let Some(last) = prev {
+                if *offset <= last {
+                    return Err(StorageError::Corruption(format!(
+                        "non-increasing compacted offsets: previous {} current {}",
+                        last, offset
+                    )));
+                }
+            }
+
+            let payload = bincode::serialize(record)?;
+            self.ensure_record_fits_segment(payload.len())?;
+            if self
+                .active
+                .will_overflow(payload.len() as u64, self.segment_bytes)
+            {
+                self.rotate()?;
+            }
+
+            self.active.append(*offset, &payload)?;
+            self.active.next_offset = self.active.next_offset.max(offset.saturating_add(1));
+            prev = Some(*offset);
+        }
+
+        self.active.flush()?;
+        if self.fsync {
+            self.active.sync()?;
+        }
+
+        Ok(())
+    }
+
+    fn collect_latest(
+        &self,
+        max_chunk_bytes: u32,
+    ) -> StorageResult<HashMap<Vec<u8>, (Offset, Record)>> {
+        let mut latest: HashMap<Vec<u8>, (Offset, Record)> = HashMap::new();
+        let chunk_bytes = max_chunk_bytes.max(1);
+
+        for segment in &self.sealed {
+            let mut next_offset = segment.base_offset;
+            loop {
+                let records = segment.read_from(next_offset, chunk_bytes)?;
+                if records.is_empty() {
+                    break;
+                }
+
+                let mut last = next_offset;
+                for r in records {
+                    last = r.offset;
+                    latest.insert(r.record.key.clone(), (r.offset, r.record));
+                }
+
+                let advanced = last.saturating_add(1);
+                if advanced <= next_offset {
+                    break;
+                }
+                next_offset = advanced;
+            }
+        }
+
+        let mut next_offset = self.active.base_offset;
+        loop {
+            let records = self.active.read_from(next_offset, chunk_bytes)?;
+            if records.is_empty() {
+                break;
+            }
+
+            let mut last = next_offset;
+            for r in records {
+                last = r.offset;
+                latest.insert(r.record.key.clone(), (r.offset, r.record));
+            }
+
+            let advanced = last.saturating_add(1);
+            if advanced <= next_offset {
+                break;
+            }
+            next_offset = advanced;
+        }
+
+        Ok(latest)
     }
 }
 
@@ -939,6 +1110,14 @@ fn commit_path(dir: &Path) -> PathBuf {
     dir.join("commit.meta")
 }
 
+const COMMIT_MAGIC: u32 = 0x524B434D; // "RKCM"
+
+#[derive(Clone, Copy)]
+struct CommitMarker {
+    last_offset: Offset,
+    trusted: bool,
+}
+
 fn write_index(path: &Path, index: &[IndexEntry]) -> StorageResult<()> {
     let bytes = bincode::serialize(index)?;
     fs::write(path, bytes)?;
@@ -948,34 +1127,66 @@ fn write_index(path: &Path, index: &[IndexEntry]) -> StorageResult<()> {
     Ok(())
 }
 
-fn load_commit(dir: &Path) -> StorageResult<Option<Offset>> {
+fn load_commit(dir: &Path) -> StorageResult<Option<CommitMarker>> {
     let path = commit_path(dir);
     if !path.exists() {
         return Ok(None);
     }
+
     let bytes = fs::read(path)?;
+
+    if bytes.len() >= 16 {
+        let mut magic = [0u8; 4];
+        magic.copy_from_slice(&bytes[0..4]);
+        let magic = u32::from_le_bytes(magic);
+        if magic == COMMIT_MAGIC {
+            let mut expected_crc = [0u8; 4];
+            expected_crc.copy_from_slice(&bytes[12..16]);
+            let expected_crc = u32::from_le_bytes(expected_crc);
+
+            let mut hasher = Hasher::new();
+            hasher.update(&bytes[0..12]);
+            let actual_crc = hasher.finalize();
+            if actual_crc != expected_crc {
+                return Ok(None);
+            }
+
+            let mut offset = [0u8; 8];
+            offset.copy_from_slice(&bytes[4..12]);
+            return Ok(Some(CommitMarker {
+                last_offset: u64::from_le_bytes(offset),
+                trusted: true,
+            }));
+        }
+    }
+
+    // Backward-compatible legacy format (8-byte offset, no integrity checksum).
     if bytes.len() < 8 {
         return Ok(None);
     }
+
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&bytes[..8]);
-    Ok(Some(u64::from_le_bytes(buf)))
+    Ok(Some(CommitMarker {
+        last_offset: u64::from_le_bytes(buf),
+        trusted: false,
+    }))
 }
 
 fn persist_commit(path: &Path, last_offset: Offset) -> StorageResult<()> {
     let mut file = File::create(path)?;
-    file.write_all(&last_offset.to_le_bytes())?;
+    let mut payload = [0u8; 16];
+    payload[0..4].copy_from_slice(&COMMIT_MAGIC.to_le_bytes());
+    payload[4..12].copy_from_slice(&last_offset.to_le_bytes());
+
+    let mut hasher = Hasher::new();
+    hasher.update(&payload[0..12]);
+    let crc = hasher.finalize();
+    payload[12..16].copy_from_slice(&crc.to_le_bytes());
+
+    file.write_all(&payload)?;
     file.sync_all()?;
     Ok(())
-}
-
-fn load_index(path: &Path) -> StorageResult<Option<Vec<IndexEntry>>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = fs::read(path)?;
-    let index: Vec<IndexEntry> = bincode::deserialize(&bytes)?;
-    Ok(Some(index))
 }
 
 fn start_position(index: &[IndexEntry], from_offset: Offset) -> u64 {
@@ -992,6 +1203,17 @@ fn start_position(index: &[IndexEntry], from_offset: Offset) -> u64 {
 
 fn frame_overhead() -> u64 {
     std::mem::size_of::<Offset>() as u64 + std::mem::size_of::<u32>() as u64 * 2
+}
+
+fn fetched_records_frame_bytes(records: &[FetchedRecord]) -> StorageResult<u64> {
+    let mut total = 0u64;
+    for r in records {
+        let payload = bincode::serialize(&r.record)?;
+        total = total
+            .saturating_add(frame_overhead())
+            .saturating_add(payload.len() as u64);
+    }
+    Ok(total)
 }
 
 fn sync_writer(writer: &mut BufWriter<File>) -> StorageResult<()> {
@@ -1141,20 +1363,6 @@ fn scan_segment(
     })
 }
 
-fn over_budget(records: &[FetchedRecord], max_bytes: u32) -> bool {
-    let mut size = 0u64;
-    for r in records.iter() {
-        size += frame_overhead();
-        size += r.record.key.len() as u64
-            + r.record.value.len() as u64
-            + std::mem::size_of::<i64>() as u64;
-        if size > max_bytes as u64 {
-            return true;
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1215,5 +1423,372 @@ mod tests {
         assert_eq!(fetched.len(), 20);
         assert_eq!(fetched.first().unwrap().offset, 0);
         assert_eq!(fetched.last().unwrap().offset, 19);
+    }
+
+    #[test]
+    fn rejects_invalid_topic_names() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path(), 1024 * 1024, None, None, 16, false).unwrap();
+        let record = Record {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+            timestamp: 0,
+        };
+
+        for topic in ["", ".", "..", "../../etc", "a/b", "a\\b", "/tmp/x"] {
+            let err = storage.append(topic, 0, vec![record.clone()]).unwrap_err();
+            assert!(
+                matches!(err, StorageError::InvalidTopic(_)),
+                "topic '{topic}' returned unexpected error: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_respects_max_bytes_across_segments() {
+        let dir = tempdir().unwrap();
+        let rec = Record {
+            key: b"k".to_vec(),
+            value: vec![b'v'; 32],
+            timestamp: 1,
+        };
+        let per_frame = frame_overhead() + bincode::serialize(&rec).unwrap().len() as u64;
+        let storage = Storage::open(dir.path(), per_frame, None, None, 1, false).unwrap();
+
+        storage
+            .append(
+                "topic",
+                0,
+                vec![rec.clone(), rec.clone(), rec.clone(), rec.clone()],
+            )
+            .unwrap();
+
+        let fetched = storage.fetch("topic", 0, 0, per_frame as u32).unwrap();
+        assert_eq!(fetched.len(), 1);
+    }
+
+    #[test]
+    fn oversized_record_is_rejected() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path(), 128, None, None, 16, false).unwrap();
+
+        let huge = Record {
+            key: b"k".to_vec(),
+            value: vec![b'x'; 1024],
+            timestamp: 0,
+        };
+
+        let err = storage.append("topic", 0, vec![huge]).unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::RecordTooLarge {
+                frame_bytes: _,
+                segment_bytes: _
+            }
+        ));
+    }
+
+    #[test]
+    fn recovery_rebuilds_index_from_segments_when_idx_is_corrupt() {
+        let dir = tempdir().unwrap();
+        {
+            let storage = Storage::open(dir.path(), 1024 * 1024, None, None, 1, false).unwrap();
+            let records = (0..8)
+                .map(|i| Record {
+                    key: format!("k{i}").into_bytes(),
+                    value: vec![b'v'; 32],
+                    timestamp: i,
+                })
+                .collect();
+            storage.append("topic", 0, records).unwrap();
+        }
+
+        let partition_dir = dir.path().join("topic").join("partition-0");
+        let idx = index_path(&segment_path(&partition_dir, 0));
+        std::fs::write(&idx, b"not-a-valid-index").unwrap();
+
+        let storage = Storage::open(dir.path(), 1024 * 1024, None, None, 1, false).unwrap();
+        let fetched = storage.fetch("topic", 0, 0, 1024 * 1024).unwrap();
+        assert_eq!(fetched.len(), 8);
+    }
+
+    #[test]
+    fn compaction_rewrites_when_all_latest_values_are_tombstones() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path(), 1024 * 1024, None, None, 16, false).unwrap();
+
+        storage
+            .append(
+                "topic",
+                0,
+                vec![
+                    Record {
+                        key: b"k1".to_vec(),
+                        value: b"v1".to_vec(),
+                        timestamp: 1,
+                    },
+                    Record {
+                        key: b"k1".to_vec(),
+                        value: Vec::new(),
+                        timestamp: 2,
+                    },
+                ],
+            )
+            .unwrap();
+
+        storage.compact("topic", 0).unwrap();
+
+        let fetched = storage.fetch("topic", 0, 0, 1024 * 1024).unwrap();
+        assert!(fetched.is_empty());
+    }
+
+    #[test]
+    fn fetch_does_not_skip_offsets_when_earliest_record_exceeds_budget() {
+        let dir = tempdir().unwrap();
+
+        let large = Record {
+            key: b"k-large".to_vec(),
+            value: vec![b'x'; 256],
+            timestamp: 1,
+        };
+        let small = Record {
+            key: b"k-small".to_vec(),
+            value: vec![b'y'; 8],
+            timestamp: 2,
+        };
+
+        let large_frame = frame_overhead() + bincode::serialize(&large).unwrap().len() as u64;
+        let small_frame = frame_overhead() + bincode::serialize(&small).unwrap().len() as u64;
+
+        let storage = Storage::open(dir.path(), large_frame, None, None, 1, false).unwrap();
+        storage
+            .append("topic", 0, vec![large, small])
+            .expect("append should rotate after first record");
+
+        let fetched = storage.fetch("topic", 0, 0, small_frame as u32).unwrap();
+        assert!(
+            fetched.is_empty(),
+            "fetch must not skip offset 0 and return newer records"
+        );
+    }
+
+    #[test]
+    fn recovery_ignores_inconsistent_commit_marker_instead_of_panicking() {
+        let dir = tempdir().unwrap();
+
+        let rec = Record {
+            key: b"k".to_vec(),
+            value: vec![b'v'; 64],
+            timestamp: 0,
+        };
+        let frame = frame_overhead() + bincode::serialize(&rec).unwrap().len() as u64;
+
+        {
+            let storage = Storage::open(dir.path(), frame, None, None, 1, false).unwrap();
+            storage
+                .append("topic", 0, vec![rec.clone(), rec.clone(), rec.clone()])
+                .unwrap();
+        }
+
+        let partition_dir = dir.path().join("topic").join("partition-0");
+        let mut segments = discover_segments(&partition_dir).unwrap();
+        segments.sort_by_key(|(base, _)| *base);
+        assert!(segments.len() >= 2);
+
+        let (_, first_seg) = segments.remove(0);
+        std::fs::remove_file(&first_seg).unwrap();
+        let _ = std::fs::remove_file(index_path(&first_seg));
+
+        // Legacy (untrusted) commit marker now points before first remaining segment base.
+        std::fs::write(commit_path(&partition_dir), 0u64.to_le_bytes()).unwrap();
+
+        let storage = Storage::open(dir.path(), frame, None, None, 1, false).unwrap();
+        let fetched = storage.fetch("topic", 0, 0, 1024 * 1024).unwrap();
+        assert!(!fetched.is_empty());
+        assert_eq!(fetched.first().map(|r| r.offset), Some(1));
+    }
+
+    #[test]
+    fn compaction_handles_sparse_latest_offsets() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path(), 1024 * 1024, None, None, 16, false).unwrap();
+
+        storage
+            .append(
+                "topic",
+                0,
+                vec![
+                    Record {
+                        key: b"k1".to_vec(),
+                        value: b"v1".to_vec(),
+                        timestamp: 1,
+                    },
+                    Record {
+                        key: b"k2".to_vec(),
+                        value: b"v2".to_vec(),
+                        timestamp: 2,
+                    },
+                    Record {
+                        key: b"k1".to_vec(),
+                        value: Vec::new(),
+                        timestamp: 3,
+                    },
+                    Record {
+                        key: b"k3".to_vec(),
+                        value: b"v3".to_vec(),
+                        timestamp: 4,
+                    },
+                ],
+            )
+            .unwrap();
+
+        storage.compact("topic", 0).unwrap();
+
+        let fetched = storage.fetch("topic", 0, 0, 1024 * 1024).unwrap();
+        assert_eq!(fetched.len(), 2);
+        assert_eq!(fetched[0].record.key, b"k2".to_vec());
+        assert_eq!(fetched[1].record.key, b"k3".to_vec());
+        assert_eq!(fetched[0].offset, 1);
+        assert_eq!(fetched[1].offset, 3);
+    }
+
+    #[test]
+    fn collect_latest_reads_all_records_across_small_chunks() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path(), 1024 * 1024, None, None, 16, false).unwrap();
+
+        let records: Vec<Record> = (0..40)
+            .map(|i| Record {
+                key: format!("k{i}").into_bytes(),
+                value: vec![b'v'; 32],
+                timestamp: i,
+            })
+            .collect();
+        storage.append("topic", 0, records).unwrap();
+
+        let key = TopicPartition {
+            topic: "topic".to_string(),
+            partition: 0,
+        };
+        let log = storage.get_log(&key).unwrap();
+        let guard = log.read();
+
+        let latest = guard.collect_latest(256).unwrap();
+        assert_eq!(latest.len(), 40);
+    }
+
+    #[test]
+    fn recovery_clamps_legacy_commit_marker_above_highest_offset() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path(), 1024 * 1024, None, None, 16, false).unwrap();
+
+        let rec = Record {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+            timestamp: 1,
+        };
+        storage
+            .append("topic", 0, vec![rec.clone(), rec.clone()])
+            .unwrap();
+
+        let partition_dir = dir.path().join("topic").join("partition-0");
+        std::fs::write(commit_path(&partition_dir), (10_000u64).to_le_bytes()).unwrap();
+
+        let reopened = Storage::open(dir.path(), 1024 * 1024, None, None, 16, false).unwrap();
+        let (base, last) = reopened.append("topic", 0, vec![rec]).unwrap();
+        assert_eq!(base, 2);
+        assert_eq!(last, 2);
+    }
+
+    #[test]
+    fn compaction_preserves_offsets_and_high_watermark_for_future_appends() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path(), 1024 * 1024, None, None, 16, false).unwrap();
+
+        storage
+            .append(
+                "topic",
+                0,
+                vec![
+                    Record {
+                        key: b"k1".to_vec(),
+                        value: b"v1".to_vec(),
+                        timestamp: 1,
+                    },
+                    Record {
+                        key: b"k2".to_vec(),
+                        value: b"v2".to_vec(),
+                        timestamp: 2,
+                    },
+                    Record {
+                        key: b"k2".to_vec(),
+                        value: Vec::new(),
+                        timestamp: 3,
+                    },
+                    Record {
+                        key: b"k3".to_vec(),
+                        value: Vec::new(),
+                        timestamp: 4,
+                    },
+                ],
+            )
+            .unwrap();
+
+        storage.compact("topic", 0).unwrap();
+
+        let after_compact = storage.fetch("topic", 0, 0, 1024 * 1024).unwrap();
+        assert_eq!(after_compact.len(), 1);
+        assert_eq!(after_compact[0].offset, 0);
+        assert_eq!(after_compact[0].record.key, b"k1".to_vec());
+
+        let (base, last) = storage
+            .append(
+                "topic",
+                0,
+                vec![Record {
+                    key: b"k4".to_vec(),
+                    value: b"v4".to_vec(),
+                    timestamp: 5,
+                }],
+            )
+            .unwrap();
+        assert_eq!(base, 4);
+        assert_eq!(last, 4);
+
+        let reopened = Storage::open(dir.path(), 1024 * 1024, None, None, 16, false).unwrap();
+        let (base2, last2) = reopened
+            .append(
+                "topic",
+                0,
+                vec![Record {
+                    key: b"k5".to_vec(),
+                    value: b"v5".to_vec(),
+                    timestamp: 6,
+                }],
+            )
+            .unwrap();
+        assert_eq!(base2, 5);
+        assert_eq!(last2, 5);
+    }
+
+    #[test]
+    fn rejects_payload_larger_than_u32_length_field() {
+        let dir = tempdir().unwrap();
+        let partition = dir.path().join("topic").join("partition-0");
+        let log = Log::create(
+            partition,
+            0,
+            16_u64 * 1024 * 1024 * 1024,
+            None,
+            None,
+            16,
+            false,
+        )
+        .unwrap();
+
+        let err = log
+            .ensure_record_fits_segment((u32::MAX as usize).saturating_add(1))
+            .unwrap_err();
+        assert!(matches!(err, StorageError::RecordLengthOverflow { .. }));
     }
 }

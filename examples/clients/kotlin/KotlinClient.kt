@@ -37,6 +37,8 @@ private fun buildHandshake(clientVersion: Short = 1): ByteArray {
 }
 
 private fun buildProduce(topic: String, partition: Int, records: List<Rec>, auth: String?): ByteArray {
+    require(records.isNotEmpty()) { "records must be non-empty" }
+
     val out = ByteArrayOutputStream()
     writeU32LE(out, 0) // variant index for Produce
 

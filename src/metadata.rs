@@ -117,7 +117,7 @@ impl Metadata {
     pub fn is_local_leader(&self, topic: &str, partition: u32) -> bool {
         self.leader(topic, partition)
             .map(|l| l == self.self_id)
-            .unwrap_or(true) // default to leader if unknown metadata
+            .unwrap_or(!self.has_source())
     }
 
     pub fn is_local_follower(&self, topic: &str, partition: u32, leader: &str) -> bool {
@@ -167,5 +167,44 @@ impl Metadata {
     fn with_state<R>(&self, f: impl FnOnce(&MetadataState) -> R) -> R {
         let guard = self.state.read();
         f(&guard)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn unknown_partition_is_not_local_leader_for_managed_metadata() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("metadata.json");
+        let payload = serde_json::json!({
+            "self_id": "node-1",
+            "nodes": {
+                "node-1": "127.0.0.1:9092"
+            },
+            "topics": {
+                "known": {
+                    "0": {
+                        "leader": "node-1",
+                        "followers": [],
+                        "epoch": 1
+                    }
+                }
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&payload).unwrap()).unwrap();
+
+        let metadata = Metadata::load(Some(&path), "node-1".to_string()).unwrap();
+
+        assert!(!metadata.is_local_leader("unknown-topic", 0));
+        assert!(!metadata.is_local_leader("known", 99));
+    }
+
+    #[test]
+    fn unknown_partition_is_local_leader_in_single_node_mode() {
+        let metadata = Metadata::single_node("node-1".to_string());
+        assert!(metadata.is_local_leader("any-topic", 0));
     }
 }

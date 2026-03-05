@@ -17,6 +17,9 @@ def build_handshake(client_version: int = 1) -> bytes:
 
 
 def build_produce(topic: str, partition: int, records: list[tuple[bytes, bytes, int]], auth: str | None) -> bytes:
+    if not records:
+        raise ValueError("records must be non-empty")
+
     buf = bytearray()
     buf += struct.pack("<I", 0)  # variant index for Produce
 
