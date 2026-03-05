@@ -383,7 +383,7 @@ impl Log {
 
         let discovered_high = metas.iter().map(|m| m.last_offset).max();
         let effective_commit = match (commit_marker, first_base, discovered_high) {
-            (Some(marker), Some(base), Some(high)) if marker.last_offset < base => None,
+            (Some(marker), Some(base), Some(_high)) if marker.last_offset < base => None,
             (Some(marker), Some(_base), Some(_high)) if marker.trusted => Some(marker.last_offset),
             (Some(marker), Some(_base), Some(high)) => Some(marker.last_offset.min(high)),
             _ => None,
