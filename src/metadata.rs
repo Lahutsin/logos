@@ -166,6 +166,6 @@ impl Metadata {
 
     fn with_state<R>(&self, f: impl FnOnce(&MetadataState) -> R) -> R {
         let guard = self.state.read();
-        f(&*guard)
+        f(&guard)
     }
 }

@@ -1,4 +1,3 @@
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -39,7 +38,7 @@ struct StorageInner {
     retention_segments: Option<usize>,
     index_stride: usize,
     fsync: bool,
-    logs: RwLock<HashMap<TopicPartition, Log>>,
+    logs: RwLock<HashMap<TopicPartition, Arc<RwLock<Log>>>>,
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
@@ -119,7 +118,10 @@ impl Storage {
                     self.inner.fsync,
                 )?;
 
-                self.inner.logs.write().insert(key, log);
+                self.inner
+                    .logs
+                    .write()
+                    .insert(key, Arc::new(RwLock::new(log)));
             }
         }
 
@@ -136,7 +138,7 @@ impl Storage {
         let this = self.clone();
         task::spawn_blocking(move || this.append(&topic, partition, records))
             .await
-            .map_err(|err| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, err)))?
+            .map_err(|err| StorageError::Io(std::io::Error::other(err)))?
     }
 
     pub fn append(
@@ -149,32 +151,9 @@ impl Storage {
             topic: topic.to_string(),
             partition,
         };
-
-        {
-            let mut guard = self.inner.logs.write();
-            if let Entry::Vacant(entry) = guard.entry(key.clone()) {
-                let dir = self.partition_dir(&key);
-                let log = Log::recover_or_create(
-                    dir,
-                    self.inner.segment_bytes,
-                    self.inner.retention_bytes,
-                    self.inner.retention_segments,
-                    self.inner.index_stride,
-                    self.inner.fsync,
-                )?;
-                entry.insert(log);
-            }
-        }
-
-        let mut guard = self.inner.logs.write();
-        let log = guard
-            .get_mut(&key)
-            .ok_or_else(|| StorageError::UnknownPartition {
-                topic: topic.to_string(),
-                partition,
-            })?;
-
-        log.append_batch(records)
+        let log = self.get_or_create_log(&key)?;
+        let mut guard = log.write();
+        guard.append_batch(records)
     }
 
     pub async fn append_with_offsets_async(
@@ -187,7 +166,7 @@ impl Storage {
         let this = self.clone();
         task::spawn_blocking(move || this.append_with_offsets(&topic, partition, entries))
             .await
-            .map_err(|err| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, err)))?
+            .map_err(|err| StorageError::Io(std::io::Error::other(err)))?
     }
 
     pub fn append_with_offsets(
@@ -200,32 +179,9 @@ impl Storage {
             topic: topic.to_string(),
             partition,
         };
-
-        {
-            let mut guard = self.inner.logs.write();
-            if let Entry::Vacant(entry) = guard.entry(key.clone()) {
-                let dir = self.partition_dir(&key);
-                let log = Log::recover_or_create(
-                    dir,
-                    self.inner.segment_bytes,
-                    self.inner.retention_bytes,
-                    self.inner.retention_segments,
-                    self.inner.index_stride,
-                    self.inner.fsync,
-                )?;
-                entry.insert(log);
-            }
-        }
-
-        let mut guard = self.inner.logs.write();
-        let log = guard
-            .get_mut(&key)
-            .ok_or_else(|| StorageError::UnknownPartition {
-                topic: topic.to_string(),
-                partition,
-            })?;
-
-        log.append_with_offsets(&entries)
+        let log = self.get_or_create_log(&key)?;
+        let mut guard = log.write();
+        guard.append_with_offsets(&entries)
     }
 
     pub async fn fetch_async(
@@ -239,7 +195,7 @@ impl Storage {
         let this = self.clone();
         task::spawn_blocking(move || this.fetch(&topic, partition, offset, max_bytes))
             .await
-            .map_err(|err| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, err)))?
+            .map_err(|err| StorageError::Io(std::io::Error::other(err)))?
     }
 
     pub fn fetch(
@@ -254,15 +210,9 @@ impl Storage {
             partition,
         };
 
-        let guard = self.inner.logs.read();
-        let log = guard
-            .get(&key)
-            .ok_or_else(|| StorageError::UnknownPartition {
-                topic: key.topic.clone(),
-                partition: key.partition,
-            })?;
-
-        log.fetch(offset, max_bytes)
+        let log = self.get_log(&key)?;
+        let guard = log.read();
+        guard.fetch(offset, max_bytes)
     }
 
     pub async fn compact_async(&self, topic: &str, partition: u32) -> StorageResult<()> {
@@ -270,7 +220,7 @@ impl Storage {
         let this = self.clone();
         task::spawn_blocking(move || this.compact(&topic, partition))
             .await
-            .map_err(|err| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, err)))?
+            .map_err(|err| StorageError::Io(std::io::Error::other(err)))?
     }
 
     pub fn compact(&self, topic: &str, partition: u32) -> StorageResult<()> {
@@ -279,28 +229,27 @@ impl Storage {
             partition,
         };
 
-        let mut guard = self.inner.logs.write();
-        let log = guard
-            .get_mut(&key)
-            .ok_or_else(|| StorageError::UnknownPartition {
-                topic: key.topic.clone(),
-                partition: key.partition,
-            })?;
-
-        log.compact()
+        let log = self.get_log(&key)?;
+        let mut guard = log.write();
+        guard.compact()
     }
 
     pub async fn run_retention_async(&self) -> StorageResult<()> {
         let this = self.clone();
         task::spawn_blocking(move || this.run_retention())
             .await
-            .map_err(|err| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, err)))?
+            .map_err(|err| StorageError::Io(std::io::Error::other(err)))?
     }
 
     pub fn run_retention(&self) -> StorageResult<()> {
-        let mut guard = self.inner.logs.write();
-        for log in guard.values_mut() {
-            log.apply_retention()?;
+        let logs: Vec<Arc<RwLock<Log>>> = {
+            let guard = self.inner.logs.read();
+            guard.values().cloned().collect()
+        };
+
+        for log in logs {
+            let mut guard = log.write();
+            guard.apply_retention()?;
         }
         Ok(())
     }
@@ -310,6 +259,42 @@ impl Storage {
             .root
             .join(&key.topic)
             .join(format!("partition-{}", key.partition))
+    }
+
+    fn get_or_create_log(&self, key: &TopicPartition) -> StorageResult<Arc<RwLock<Log>>> {
+        if let Some(log) = self.inner.logs.read().get(key).cloned() {
+            return Ok(log);
+        }
+
+        let mut guard = self.inner.logs.write();
+        if let Some(log) = guard.get(key).cloned() {
+            return Ok(log);
+        }
+
+        let dir = self.partition_dir(key);
+        let log = Log::recover_or_create(
+            dir,
+            self.inner.segment_bytes,
+            self.inner.retention_bytes,
+            self.inner.retention_segments,
+            self.inner.index_stride,
+            self.inner.fsync,
+        )?;
+        let log = Arc::new(RwLock::new(log));
+        guard.insert(key.clone(), log.clone());
+        Ok(log)
+    }
+
+    fn get_log(&self, key: &TopicPartition) -> StorageResult<Arc<RwLock<Log>>> {
+        self.inner
+            .logs
+            .read()
+            .get(key)
+            .cloned()
+            .ok_or_else(|| StorageError::UnknownPartition {
+                topic: key.topic.clone(),
+                partition: key.partition,
+            })
     }
 }
 
@@ -343,7 +328,15 @@ impl Log {
         let committed = load_commit(&dir)?;
 
         if segments.is_empty() {
-            return Self::create(dir, 0, segment_bytes, retention_bytes, retention_segments, index_stride, fsync);
+            return Self::create(
+                dir,
+                0,
+                segment_bytes,
+                retention_bytes,
+                retention_segments,
+                index_stride,
+                fsync,
+            );
         }
 
         let mut metas = Vec::new();
@@ -434,11 +427,26 @@ impl Log {
         index_stride: usize,
         fsync: bool,
     ) -> StorageResult<Self> {
-        let has_segments = discover_segments(&dir)?.len() > 0;
+        let has_segments = !discover_segments(&dir)?.is_empty();
         if has_segments {
-            Self::recover(dir, segment_bytes, retention_bytes, retention_segments, index_stride, fsync)
+            Self::recover(
+                dir,
+                segment_bytes,
+                retention_bytes,
+                retention_segments,
+                index_stride,
+                fsync,
+            )
         } else {
-            Self::create(dir, 0, segment_bytes, retention_bytes, retention_segments, index_stride, fsync)
+            Self::create(
+                dir,
+                0,
+                segment_bytes,
+                retention_bytes,
+                retention_segments,
+                index_stride,
+                fsync,
+            )
         }
     }
 
@@ -451,7 +459,10 @@ impl Log {
         let batch_start = self.active.next_offset;
         for record in records {
             let payload = bincode::serialize(&record)?;
-            if self.active.will_overflow(payload.len() as u64, self.segment_bytes) {
+            if self
+                .active
+                .will_overflow(payload.len() as u64, self.segment_bytes)
+            {
                 self.rotate()?;
             }
             let offset = self.active.next_offset;
@@ -492,13 +503,19 @@ impl Log {
         Ok(out)
     }
 
-    fn append_with_offsets(&mut self, records: &[(Offset, Record)]) -> StorageResult<(Offset, Offset)> {
+    fn append_with_offsets(
+        &mut self,
+        records: &[(Offset, Record)],
+    ) -> StorageResult<(Offset, Offset)> {
         if records.is_empty() {
             let last = self.active.next_offset.saturating_sub(1);
             return Ok((self.active.next_offset, last));
         }
 
-        let batch_start = records.first().map(|(o, _)| *o).unwrap_or(self.active.next_offset);
+        let batch_start = records
+            .first()
+            .map(|(o, _)| *o)
+            .unwrap_or(self.active.next_offset);
         let mut batch_end = batch_start;
 
         for (offset, record) in records.iter() {
@@ -509,7 +526,10 @@ impl Log {
                 )));
             }
             let payload = bincode::serialize(record)?;
-            if self.active.will_overflow(payload.len() as u64, self.segment_bytes) {
+            if self
+                .active
+                .will_overflow(payload.len() as u64, self.segment_bytes)
+            {
                 self.rotate()?;
             }
             self.active.append(*offset, &payload)?;
@@ -527,7 +547,11 @@ impl Log {
 
     fn rotate(&mut self) -> StorageResult<()> {
         let next_base = self.active.next_offset;
-        let new_active = Segment::create(segment_path(&self.dir, next_base), next_base, self.index_stride)?;
+        let new_active = Segment::create(
+            segment_path(&self.dir, next_base),
+            next_base,
+            self.index_stride,
+        )?;
         let sealed = std::mem::replace(&mut self.active, new_active).seal()?;
         self.sealed_bytes = self.sealed_bytes.saturating_add(sealed.size);
         self.sealed.push(sealed);
@@ -615,12 +639,33 @@ impl Log {
 
         new_log.append_with_offsets(&compacted)?;
         new_log.apply_retention()?;
+        sync_dir(&new_dir)?;
 
         let backup_dir = self.dir.with_extension("old");
         let _ = fs::remove_dir_all(&backup_dir);
-        // Rename existing dir aside and swap in compacted log.
+        let parent_dir = self
+            .dir
+            .parent()
+            .ok_or_else(|| {
+                StorageError::Corruption("partition directory has no parent".to_string())
+            })?
+            .to_path_buf();
+
+        // Rename existing dir aside and swap in compacted log with rollback.
         fs::rename(&self.dir, &backup_dir)?;
-        fs::rename(&new_dir, &self.dir)?;
+        sync_dir(&parent_dir)?;
+
+        if let Err(err) = fs::rename(&new_dir, &self.dir) {
+            let rollback = fs::rename(&backup_dir, &self.dir);
+            let _ = sync_dir(&parent_dir);
+            return match rollback {
+                Ok(_) => Err(StorageError::Io(err)),
+                Err(rb_err) => Err(StorageError::Corruption(format!(
+                    "compaction swap failed: {err}; rollback failed: {rb_err}"
+                ))),
+            };
+        }
+        sync_dir(&parent_dir)?;
 
         let rebuilt = Log::recover(
             self.dir.clone(),
@@ -633,6 +678,7 @@ impl Log {
 
         *self = rebuilt;
         let _ = fs::remove_dir_all(&backup_dir);
+        let _ = sync_dir(&parent_dir);
         Ok(())
     }
 }
@@ -707,7 +753,7 @@ impl Segment {
 
     fn append(&mut self, offset: Offset, payload: &[u8]) -> StorageResult<()> {
         let frame_pos = self.size;
-        if self.records % self.index_stride as u64 == 0 {
+        if self.records.is_multiple_of(self.index_stride as u64) {
             self.index.push(IndexEntry {
                 offset,
                 position: frame_pos,
@@ -870,7 +916,10 @@ impl SegmentMeta {
             }
 
             let record: Record = bincode::deserialize(&payload)?;
-            out.push(FetchedRecord { offset: off, record });
+            out.push(FetchedRecord {
+                offset: off,
+                record,
+            });
             budget = budget.saturating_sub(frame_size);
         }
 
@@ -948,6 +997,11 @@ fn frame_overhead() -> u64 {
 fn sync_writer(writer: &mut BufWriter<File>) -> StorageResult<()> {
     writer.flush()?;
     writer.get_mut().sync_all()?;
+    Ok(())
+}
+
+fn sync_dir(path: &Path) -> StorageResult<()> {
+    File::open(path)?.sync_all()?;
     Ok(())
 }
 
@@ -1062,7 +1116,7 @@ fn scan_segment(
 
         last_offset = offset;
 
-        if records % index_stride as u64 == 0 {
+        if records.is_multiple_of(index_stride as u64) {
             index.push(IndexEntry {
                 offset,
                 position: frame_start,
@@ -1091,7 +1145,9 @@ fn over_budget(records: &[FetchedRecord], max_bytes: u32) -> bool {
     let mut size = 0u64;
     for r in records.iter() {
         size += frame_overhead();
-        size += r.record.key.len() as u64 + r.record.value.len() as u64 + std::mem::size_of::<i64>() as u64;
+        size += r.record.key.len() as u64
+            + r.record.value.len() as u64
+            + std::mem::size_of::<i64>() as u64;
         if size > max_bytes as u64 {
             return true;
         }

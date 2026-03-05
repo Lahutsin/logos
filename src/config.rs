@@ -95,7 +95,10 @@ impl Config {
         let replication_auth_token = env::var("RK_REPLICATION_TOKEN").ok();
 
         let admin_bind = env::var("RK_ADMIN_ADDR").unwrap_or_else(|_| "127.0.0.1:9100".to_string());
-        let admin_token = env::var("RK_ADMIN_TOKEN").ok();
+        let admin_token = env::var("RK_ADMIN_TOKEN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
 
         let tls_cert = env::var("RK_TLS_CERT").ok().map(PathBuf::from);
         let tls_key = env::var("RK_TLS_KEY").ok().map(PathBuf::from);

@@ -27,41 +27,45 @@ This disables auth/TLS so you can replay the fixture frames in `tests/fixtures/v
 
 ## Production checklist
 - TLS: set `RK_TLS_CERT`/`RK_TLS_KEY` and `RK_TLS_CA` (and `RK_TLS_CLIENT_CA` if you require mTLS). Set `RK_REQUIRE_TLS=true` to fail fast without certs.
-- AuthZ/AuthN: provide `RK_AUTH_PATH` and leave `RK_REQUIRE_AUTH=true` (default). Set `RK_REPLICATION_TOKEN` mapped to a principal with `allow_replicate=true`. Set `RK_ADMIN_TOKEN` for admin/metrics. Restrict admin network (Helm NetworkPolicy or your own).
+- AuthZ/AuthN: provide `RK_AUTH_PATH` and leave `RK_REQUIRE_AUTH=true` (default). Set `RK_REPLICATION_TOKEN` mapped to a principal with `allow_replicate=true`. Set `RK_ADMIN_TOKEN` for admin/metrics (required when `RK_ADMIN_ADDR` is non-loopback). Restrict admin network (Helm NetworkPolicy or your own).
 - Persistence: enable Helm `.Values.productionProfile.enabled=true` (or `persistence.enabled=true`) and configure `persistence.storageClass/size`.
 - Limits and safety: tune `RK_MAX_FRAME_BYTES`, `RK_MAX_BATCH_BYTES`, `RK_MAX_CONNECTIONS`, replication timeouts/retries, and `RK_FSYNC` (leave true for durability).
 - Metadata: in multi-node setups, supply a metadata JSON via `RK_METADATA_PATH` so leaders/followers and epochs fence stale writers.
 - Observability: scrape Prometheus metrics on `RK_ADMIN_ADDR`; watch TLS/auth failures, replication lag, and disk usage.
 
 ## Configuration (env, defaults in parens)
-- `RK_BIND_ADDR` (`0.0.0.0:9092`)
-- `RK_ADMIN_ADDR` (`127.0.0.1:9100`)
-- `RK_DATA_DIR` (`./data`)
-- `RK_SEGMENT_BYTES` (`134217728`)
-- `RK_MAX_CONNECTIONS` (`1024`)
-- `RK_RETENTION_BYTES` / `RK_RETENTION_SEGMENTS` (unset = keep all sealed segments)
-- `RK_INDEX_STRIDE` (`16`)
-- `RK_NODE_ID` (`node-1`)
-- `RK_METADATA_PATH` (unset = single-node leader)
-- `RK_METADATA_REFRESH_MS` (`1000`)
-- `RK_REPLICATION_ACKS` (`1`)
-- `RK_REPLICATION_TIMEOUT_MS` (`1000`)
-- `RK_REPLICATION_RETRIES` (`2`)
-- `RK_REPLICATION_BACKOFF_MS` (`200`)
-- `RK_REPLICATION_TOKEN` (unset)
-- `RK_FSYNC` (`true`)
-- `RK_MAX_FRAME_BYTES` (`4194304`)
-- `RK_MAX_BATCH_BYTES` (`4194304`)
-- `RK_AUTH_PATH` (unset)
-- `RK_REQUIRE_AUTH` (`true`)
-- `RK_TLS_CERT` / `RK_TLS_KEY` (unset)
-- `RK_TLS_CLIENT_CA` (unset)
-- `RK_TLS_CA` (unset)
-- `RK_TLS_DOMAIN` (unset)
-- `RK_ADMIN_TOKEN` (unset)
-- `RK_REQUIRE_TLS` (`false`)
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `RK_BIND_ADDR` | `0.0.0.0:9092` | TCP listen address for the broker protocol. |
+| `RK_ADMIN_ADDR` | `127.0.0.1:9100` | HTTP listen address for `/healthz`, `/metrics`, and admin endpoints. |
+| `RK_DATA_DIR` | `./data` | Root directory for segment files and partition data. |
+| `RK_SEGMENT_BYTES` | `134217728` | Maximum size of an active segment before rotation. |
+| `RK_MAX_CONNECTIONS` | `1024` | Maximum concurrent accepted client connections. |
+| `RK_RETENTION_BYTES` | `unset` | Retention cap for total sealed segment bytes per partition. |
+| `RK_RETENTION_SEGMENTS` | `unset` | Retention cap for number of sealed segments per partition. |
+| `RK_INDEX_STRIDE` | `16` | Sparse index sampling interval (every N records). |
+| `RK_NODE_ID` | `node-1` | Local node identifier used by metadata/replication. |
+| `RK_METADATA_PATH` | `unset` | Path to metadata JSON; when unset, broker runs in single-node mode. |
+| `RK_METADATA_REFRESH_MS` | `1000` | Metadata reload interval in milliseconds. |
+| `RK_REPLICATION_ACKS` | `1` | Required acknowledgements for produce (`1` = leader only). |
+| `RK_REPLICATION_TIMEOUT_MS` | `1000` | Timeout for each replication attempt in milliseconds. |
+| `RK_REPLICATION_RETRIES` | `2` | Number of replication retries per follower. |
+| `RK_REPLICATION_BACKOFF_MS` | `200` | Delay between replication retries in milliseconds. |
+| `RK_REPLICATION_TOKEN` | `unset` | Token used for inter-node replication auth. |
+| `RK_FSYNC` | `true` | Whether writes are fsynced for stronger durability. |
+| `RK_MAX_FRAME_BYTES` | `4194304` | Maximum incoming protocol frame size. |
+| `RK_MAX_BATCH_BYTES` | `4194304` | Maximum payload bytes allowed in produce/replicate batch. |
+| `RK_AUTH_PATH` | `unset` | Path to auth principals/tokens JSON file. |
+| `RK_REQUIRE_AUTH` | `true` | Fail startup when auth is not configured. |
+| `RK_TLS_CERT` | `unset` | Path to server certificate PEM for inbound TLS. |
+| `RK_TLS_KEY` | `unset` | Path to server private key PEM for inbound TLS. |
+| `RK_TLS_CLIENT_CA` | `unset` | Optional client CA bundle for mTLS verification. |
+| `RK_TLS_CA` | `unset` | CA bundle used for outbound TLS verification. |
+| `RK_TLS_DOMAIN` | `unset` | TLS SNI/server name for outbound replication TLS. |
+| `RK_ADMIN_TOKEN` | `unset` | Bearer token for admin/metrics access; when unset, admin endpoints return unauthorized. |
+| `RK_REQUIRE_TLS` | `false` | Fail startup when TLS endpoints are not fully configured. |
 
-Helm: set `.Values.productionProfile.enabled=true` to turn on persistence, TLS, and auth defaults; wire secrets for cert/key/CA, auth file, and replication token.
+Helm: set `.Values.productionProfile.enabled=true` to turn on persistence, TLS, and auth defaults; wire secrets for cert/key/CA, auth file, replication token, and admin token (`.Values.adminTokenSecret` or `.Values.env.adminToken`). By default, admin service port is not exposed and NetworkPolicy is enabled.
 
 ## Protocol (MVP)
 Frames are length-delimited (u32 big-endian) and contain `bincode`-encoded structs. `PROTOCOL_VERSION = 1`. Clients start with `Handshake { client_version }`; server replies `HandshakeOk { server_version }`.

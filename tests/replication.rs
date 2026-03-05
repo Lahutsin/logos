@@ -97,7 +97,14 @@ async fn start_node(
     let metadata = Arc::new(Metadata::load(Some(metadata_path), node_id.to_string())?);
     let replicator = Replicator::new(metadata.clone(), 1_000, 3, 50, plaintext_tls(), None);
     let authz = Authz::load(None)?;
-    let broker = Broker::new(storage, replicator, metadata, ack_quorum, authz, 4 * 1024 * 1024);
+    let broker = Broker::new(
+        storage,
+        replicator,
+        metadata,
+        ack_quorum,
+        authz,
+        4 * 1024 * 1024,
+    );
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
@@ -162,14 +169,31 @@ async fn replication_satisfies_quorum_and_copies_data() -> Result<()> {
         "node-1",
         &["node-2"],
         1,
-        &[("node-1", leader_addr.to_string()), ("node-2", follower_addr.to_string())],
+        &[
+            ("node-1", leader_addr.to_string()),
+            ("node-2", follower_addr.to_string()),
+        ],
     )?;
 
     let leader_storage = open_storage(&tmp.path().join("leader"))?;
     let follower_storage = open_storage(&tmp.path().join("follower"))?;
 
-    let leader = start_node("node-1", leader_listener, &metadata_path, leader_storage.clone(), 2).await?;
-    let follower = start_node("node-2", follower_listener, &metadata_path, follower_storage.clone(), 1).await?;
+    let leader = start_node(
+        "node-1",
+        leader_listener,
+        &metadata_path,
+        leader_storage.clone(),
+        2,
+    )
+    .await?;
+    let follower = start_node(
+        "node-2",
+        follower_listener,
+        &metadata_path,
+        follower_storage.clone(),
+        1,
+    )
+    .await?;
 
     let mut producer = Client::connect(&leader_addr.to_string()).await?;
     let resp = producer
@@ -177,7 +201,11 @@ async fn replication_satisfies_quorum_and_copies_data() -> Result<()> {
         .await?;
 
     match resp {
-        Response::Produced { acks, base_offset, last_offset } => {
+        Response::Produced {
+            acks,
+            base_offset,
+            last_offset,
+        } => {
             assert_eq!(2, acks);
             assert_eq!(0, base_offset);
             assert_eq!(0, last_offset);
@@ -221,14 +249,31 @@ async fn replication_rejects_non_contiguous_offsets_and_blocks_quorum() -> Resul
         "node-1",
         &["node-2"],
         1,
-        &[("node-1", leader_addr.to_string()), ("node-2", follower_addr.to_string())],
+        &[
+            ("node-1", leader_addr.to_string()),
+            ("node-2", follower_addr.to_string()),
+        ],
     )?;
 
     let leader_storage = open_storage(&tmp.path().join("leader"))?;
     let follower_storage = open_storage(&tmp.path().join("follower"))?;
 
-    let leader = start_node("node-1", leader_listener, &metadata_path, leader_storage.clone(), 2).await?;
-    let follower = start_node("node-2", follower_listener, &metadata_path, follower_storage.clone(), 1).await?;
+    let leader = start_node(
+        "node-1",
+        leader_listener,
+        &metadata_path,
+        leader_storage.clone(),
+        2,
+    )
+    .await?;
+    let follower = start_node(
+        "node-2",
+        follower_listener,
+        &metadata_path,
+        follower_storage.clone(),
+        1,
+    )
+    .await?;
 
     follower_storage
         .append(topic, 0, vec![make_record("rogue", "stale", 1)])
@@ -241,7 +286,10 @@ async fn replication_rejects_non_contiguous_offsets_and_blocks_quorum() -> Resul
 
     match resp {
         Response::Error(msg) => {
-            assert!(msg.contains("acks 1/2 not satisfied"), "unexpected error: {msg}");
+            assert!(
+                msg.contains("acks 1/2 not satisfied"),
+                "unexpected error: {msg}"
+            );
         }
         other => panic!("expected quorum failure, got {other:?}"),
     }
@@ -282,14 +330,31 @@ async fn replication_recovers_after_leader_change_and_redelivery() -> Result<()>
         "node-1",
         &["node-2"],
         1,
-        &[("node-1", leader_addr.to_string()), ("node-2", follower_addr.to_string())],
+        &[
+            ("node-1", leader_addr.to_string()),
+            ("node-2", follower_addr.to_string()),
+        ],
     )?;
 
     let leader_storage = open_storage(&tmp.path().join("leader"))?;
     let follower_storage = open_storage(&tmp.path().join("follower"))?;
 
-    let leader = start_node("node-1", leader_listener, &metadata_path, leader_storage.clone(), 2).await?;
-    let follower = start_node("node-2", follower_listener, &metadata_path, follower_storage.clone(), 1).await?;
+    let leader = start_node(
+        "node-1",
+        leader_listener,
+        &metadata_path,
+        leader_storage.clone(),
+        2,
+    )
+    .await?;
+    let follower = start_node(
+        "node-2",
+        follower_listener,
+        &metadata_path,
+        follower_storage.clone(),
+        1,
+    )
+    .await?;
 
     let mut client = Client::connect(&leader_addr.to_string()).await?;
     let resp = client
@@ -313,27 +378,47 @@ async fn replication_recovers_after_leader_change_and_redelivery() -> Result<()>
         "node-2",
         &["node-1"],
         2,
-        &[("node-1", new_follower_addr.to_string()), ("node-2", new_leader_addr.to_string())],
+        &[
+            ("node-1", new_follower_addr.to_string()),
+            ("node-2", new_leader_addr.to_string()),
+        ],
     )?;
 
-    let new_leader = start_node("node-2", new_leader_listener, &metadata_path_epoch2, follower_storage.clone(), 2).await?;
-    let new_follower = start_node("node-1", new_follower_listener, &metadata_path_epoch2, leader_storage.clone(), 1).await?;
+    let new_leader = start_node(
+        "node-2",
+        new_leader_listener,
+        &metadata_path_epoch2,
+        follower_storage.clone(),
+        2,
+    )
+    .await?;
+    let new_follower = start_node(
+        "node-1",
+        new_follower_listener,
+        &metadata_path_epoch2,
+        leader_storage.clone(),
+        1,
+    )
+    .await?;
 
     let mut new_client = Client::connect(&new_leader_addr.to_string()).await?;
     let second = new_client
         .produce(topic, 0, vec![make_record("k2", "v2", 1)], None)
         .await?;
-    assert!(matches!(second, Response::Produced { acks: 2, base_offset: 1, last_offset: 1 }));
+    assert!(matches!(
+        second,
+        Response::Produced {
+            acks: 2,
+            base_offset: 1,
+            last_offset: 1
+        }
+    ));
 
     let mut leader_fetch = Client::connect(&new_leader_addr.to_string()).await?;
-    let leader_records = leader_fetch
-        .fetch(topic, 0, 0, 1024 * 1024, None)
-        .await?;
+    let leader_records = leader_fetch.fetch(topic, 0, 0, 1024 * 1024, None).await?;
 
     let mut follower_fetch = Client::connect(&new_follower_addr.to_string()).await?;
-    let follower_records = follower_fetch
-        .fetch(topic, 0, 0, 1024 * 1024, None)
-        .await?;
+    let follower_records = follower_fetch.fetch(topic, 0, 0, 1024 * 1024, None).await?;
 
     for resp in [leader_records, follower_records] {
         match resp {

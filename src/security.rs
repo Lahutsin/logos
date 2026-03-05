@@ -6,10 +6,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
-use tokio_rustls::rustls::{self, Certificate, ClientConfig, PrivateKey, RootCertStore, ServerConfig, ServerName};
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 use serde::Deserialize;
 use tokio::sync::Mutex;
+use tokio_rustls::rustls::{
+    self, Certificate, ClientConfig, PrivateKey, RootCertStore, ServerConfig, ServerName,
+};
 
 #[derive(Debug, Clone)]
 pub struct TlsOptions {
@@ -34,30 +36,35 @@ impl TlsEndpoints {
 }
 
 pub fn build_tls_endpoints(opts: &TlsOptions) -> anyhow::Result<TlsEndpoints> {
-    let (acceptor, server_cert, server_key) = if let (Some(cert), Some(key)) = (opts.cert.as_ref(), opts.key.as_ref()) {
-        let certs = load_certs(cert)?;
-        let key = load_key(key)?;
-        let mut server = if let Some(ca) = opts.client_ca_cert.as_ref() {
-            let mut roots = RootCertStore::empty();
-            for c in load_certs(ca)? {
-                roots.add(&c)?;
-            }
-            let verifier = rustls::server::AllowAnyAuthenticatedClient::new(roots);
-            ServerConfig::builder()
-                .with_safe_defaults()
-                .with_client_cert_verifier(Arc::new(verifier))
-                .with_single_cert(certs.clone(), key.clone())?
+    let (acceptor, server_cert, server_key) =
+        if let (Some(cert), Some(key)) = (opts.cert.as_ref(), opts.key.as_ref()) {
+            let certs = load_certs(cert)?;
+            let key = load_key(key)?;
+            let mut server = if let Some(ca) = opts.client_ca_cert.as_ref() {
+                let mut roots = RootCertStore::empty();
+                for c in load_certs(ca)? {
+                    roots.add(&c)?;
+                }
+                let verifier = rustls::server::AllowAnyAuthenticatedClient::new(roots);
+                ServerConfig::builder()
+                    .with_safe_defaults()
+                    .with_client_cert_verifier(Arc::new(verifier))
+                    .with_single_cert(certs.clone(), key.clone())?
+            } else {
+                ServerConfig::builder()
+                    .with_safe_defaults()
+                    .with_no_client_auth()
+                    .with_single_cert(certs.clone(), key.clone())?
+            };
+            server.alpn_protocols.push(b"rk".to_vec());
+            (
+                Some(tokio_rustls::TlsAcceptor::from(Arc::new(server))),
+                Some(certs),
+                Some(key),
+            )
         } else {
-            ServerConfig::builder()
-                .with_safe_defaults()
-                .with_no_client_auth()
-                .with_single_cert(certs.clone(), key.clone())?
+            (None, None, None)
         };
-        server.alpn_protocols.push(b"rk".to_vec());
-        (Some(tokio_rustls::TlsAcceptor::from(Arc::new(server))), Some(certs), Some(key))
-    } else {
-        (None, None, None)
-    };
 
     let connector = if let Some(ca_path) = opts.ca_cert.as_ref() {
         let mut roots = RootCertStore::empty();
@@ -123,7 +130,7 @@ pub enum AuthError {
     Missing,
     #[error("invalid token")]
     Invalid,
-    #[error("not authorized for topic")] 
+    #[error("not authorized for topic")]
     Forbidden,
     #[error("quota exceeded")]
     Quota,
@@ -190,7 +197,13 @@ impl Authz {
         self.enabled
     }
 
-    pub async fn authorize(&self, token: Option<&str>, topic: &str, action: Action, bytes: u64) -> Result<(), AuthError> {
+    pub async fn authorize(
+        &self,
+        token: Option<&str>,
+        topic: &str,
+        action: Action,
+        bytes: u64,
+    ) -> Result<(), AuthError> {
         if !self.enabled {
             return Ok(());
         }

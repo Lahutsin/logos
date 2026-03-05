@@ -1,22 +1,29 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::{self, Duration};
 
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    routing::get,
+    routing::post,
+    Json, Router,
+};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use logos::broker::Broker;
 use logos::config::Config;
 use logos::metadata::Metadata;
 use logos::metrics::render_prometheus;
-use logos::protocol::{self, Request};
+use logos::protocol::{self, Request, Response};
 use logos::replication::Replicator;
 use logos::security::{build_tls_endpoints, Authz, TlsOptions};
 use logos::storage::Storage;
+use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::Semaphore;
-use axum::{extract::State, http::{HeaderMap, StatusCode}, routing::get, routing::post, Json, Router};
-use serde::Deserialize;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{info, warn};
 
@@ -26,6 +33,15 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env();
     info!(?config, "starting logos");
+
+    let admin_addr: SocketAddr = config
+        .admin_bind
+        .parse()
+        .map_err(|err| anyhow::anyhow!("invalid RK_ADMIN_ADDR '{}': {err}", config.admin_bind))?;
+
+    if !admin_addr.ip().is_loopback() && config.admin_token.is_none() {
+        anyhow::bail!("RK_ADMIN_TOKEN is required when RK_ADMIN_ADDR is not loopback");
+    }
 
     let metadata = Arc::new(Metadata::load(
         config.metadata_path.as_deref(),
@@ -57,12 +73,28 @@ async fn main() -> anyhow::Result<()> {
 
     if config.require_tls {
         if tls.acceptor.is_none() || tls.connector.is_none() {
-            anyhow::bail!("require_tls=true but TLS acceptor/connector not fully configured (cert/key/ca)");
+            anyhow::bail!(
+                "require_tls=true but TLS acceptor/connector not fully configured (cert/key/ca)"
+            );
+        }
+        if config
+            .tls_domain
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .is_none()
+        {
+            anyhow::bail!("require_tls=true but RK_TLS_DOMAIN is missing or empty");
+        }
+        if tls.server_name.is_none() {
+            anyhow::bail!("require_tls=true but RK_TLS_DOMAIN is invalid for TLS SNI/server name");
         }
     }
 
     if config.require_auth && config.replication_auth_token.is_none() {
-        anyhow::bail!("require_auth=true but RK_REPLICATION_TOKEN is missing for inter-node replication");
+        anyhow::bail!(
+            "require_auth=true but RK_REPLICATION_TOKEN is missing for inter-node replication"
+        );
     }
 
     if metadata.has_source() {
@@ -97,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
         config.max_batch_bytes,
     );
 
-    run_server(config, broker, tls, storage).await
+    run_server(config, broker, tls, storage, admin_addr).await
 }
 
 fn init_tracing() -> anyhow::Result<()> {
@@ -117,21 +149,25 @@ async fn run_server(
     broker: Broker,
     tls: logos::security::TlsEndpoints,
     storage: Storage,
+    admin_addr: SocketAddr,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&config.bind_addr).await?;
     let limiter = Arc::new(Semaphore::new(config.max_connections));
 
     // Admin/metrics server
-    let admin_addr = config.admin_bind.clone();
     let storage_clone = storage.clone();
     let admin_token = config.admin_token.clone();
     tokio::spawn(async move {
         let router = Router::new()
+            .route("/healthz", get(health_handler))
             .route("/metrics", get(metrics_handler))
             .route("/admin/compact", post(compact_handler))
             .route("/admin/retention", post(retention_handler))
-            .with_state(AdminState { storage: storage_clone, token: admin_token });
-        if let Err(err) = axum::Server::bind(&admin_addr.parse().unwrap())
+            .with_state(AdminState {
+                storage: storage_clone,
+                token: admin_token,
+            });
+        if let Err(err) = axum::Server::bind(&admin_addr)
             .serve(router.into_make_service())
             .await
         {
@@ -197,7 +233,11 @@ async fn run_server(
     Ok(())
 }
 
-async fn handle_connection<S>(stream: S, broker: Broker, max_frame_bytes: usize) -> anyhow::Result<()>
+async fn handle_connection<S>(
+    stream: S,
+    broker: Broker,
+    max_frame_bytes: usize,
+) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -209,6 +249,7 @@ where
         .new_codec();
 
     let mut framed = Framed::new(stream, codec);
+    let mut handshake_done = false;
 
     while let Some(frame) = framed.next().await {
         let bytes = match frame {
@@ -227,6 +268,44 @@ where
             }
         };
 
+        if !handshake_done {
+            match request {
+                Request::Handshake { client_version } => {
+                    if client_version != protocol::PROTOCOL_VERSION {
+                        let response = Response::Error(format!(
+                            "protocol version mismatch: client {} server {}",
+                            client_version,
+                            protocol::PROTOCOL_VERSION
+                        ));
+                        let encoded = protocol::encode(&response)?;
+                        framed.send(Bytes::from(encoded)).await?;
+                        break;
+                    }
+
+                    handshake_done = true;
+                    let response = Response::HandshakeOk {
+                        server_version: protocol::PROTOCOL_VERSION,
+                    };
+                    let encoded = protocol::encode(&response)?;
+                    framed.send(Bytes::from(encoded)).await?;
+                    continue;
+                }
+                _ => {
+                    let response = Response::Error("handshake required".to_string());
+                    let encoded = protocol::encode(&response)?;
+                    framed.send(Bytes::from(encoded)).await?;
+                    break;
+                }
+            }
+        }
+
+        if matches!(request, Request::Handshake { .. }) {
+            let response = Response::Error("handshake already completed".to_string());
+            let encoded = protocol::encode(&response)?;
+            framed.send(Bytes::from(encoded)).await?;
+            continue;
+        }
+
         let response = broker.handle(request).await;
         let encoded = protocol::encode(&response)?;
         framed.send(Bytes::from(encoded)).await?;
@@ -242,20 +321,36 @@ struct AdminState {
     token: Option<String>,
 }
 
-fn authorize_admin(expected: &Option<String>, headers: &axum::http::HeaderMap) -> Result<(), StatusCode> {
-    if let Some(required) = expected.as_ref() {
-        let provided = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.trim());
-        if provided != Some(&format!("Bearer {required}")) {
-            return Err(StatusCode::UNAUTHORIZED);
-        }
+fn authorize_admin(
+    expected: &Option<String>,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), StatusCode> {
+    let required = expected
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let provided = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim());
+    let expected_header = format!("Bearer {required}");
+    if provided != Some(expected_header.as_str()) {
+        return Err(StatusCode::UNAUTHORIZED);
     }
+
     Ok(())
 }
 
-async fn metrics_handler(State(state): State<AdminState>, headers: HeaderMap) -> Result<String, StatusCode> {
+async fn health_handler() -> StatusCode {
+    StatusCode::OK
+}
+
+async fn metrics_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<String, StatusCode> {
     authorize_admin(&state.token, &headers)?;
     Ok(render_prometheus())
 }
@@ -266,7 +361,11 @@ struct CompactReq {
     partition: u32,
 }
 
-async fn compact_handler(State(state): State<AdminState>, headers: HeaderMap, Json(req): Json<CompactReq>) -> Result<String, StatusCode> {
+async fn compact_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(req): Json<CompactReq>,
+) -> Result<String, StatusCode> {
     authorize_admin(&state.token, &headers)?;
     state
         .storage
@@ -276,7 +375,10 @@ async fn compact_handler(State(state): State<AdminState>, headers: HeaderMap, Js
     Ok("ok".to_string())
 }
 
-async fn retention_handler(State(state): State<AdminState>, headers: HeaderMap) -> Result<String, StatusCode> {
+async fn retention_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<String, StatusCode> {
     authorize_admin(&state.token, &headers)?;
     state
         .storage

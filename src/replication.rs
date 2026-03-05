@@ -10,7 +10,7 @@ use tracing::warn;
 
 use crate::metadata::Metadata;
 use crate::metrics::inc_request;
-use crate::protocol::{self, ReplicaRecord, ReplicateRequest, Request, Response};
+use crate::protocol::{self, ReplicaRecord, ReplicateRequest, Request, Response, PROTOCOL_VERSION};
 use crate::security::TlsEndpoints;
 
 #[derive(Clone)]
@@ -48,7 +48,11 @@ impl Replicator {
             timeout: Duration::from_millis(0),
             retries: 0,
             backoff: Duration::from_millis(0),
-            tls: TlsEndpoints { acceptor: None, connector: None, server_name: None },
+            tls: TlsEndpoints {
+                acceptor: None,
+                connector: None,
+                server_name: None,
+            },
             auth_token: None,
         }
     }
@@ -107,11 +111,17 @@ async fn replicate_once(
 
     let action = async move {
         let tcp = TcpStream::connect(&addr).await?;
-        let codec = LengthDelimitedCodec::builder().length_field_length(4).new_codec();
+        let codec = LengthDelimitedCodec::builder()
+            .length_field_length(4)
+            .new_codec();
 
-        if let (Some(connector), Some(name)) = (tls.connector, tls.server_name.clone()) {
+        if let Some(connector) = tls.connector {
+            let name = tls.server_name.clone().ok_or_else(|| {
+                anyhow::anyhow!("tls connector configured but server_name is missing")
+            })?;
             let tls_stream = connector.connect(name, tcp).await?;
             let mut framed = Framed::new(tls_stream, codec);
+            perform_handshake(&mut framed).await?;
             let payload = protocol::encode(&Request::Replicate(req.clone()))?;
             framed.send(Bytes::from(payload)).await?;
             if let Some(frame) = framed.next().await.transpose()? {
@@ -133,6 +143,7 @@ async fn replicate_once(
             }
         } else {
             let mut framed = Framed::new(tcp, codec);
+            perform_handshake(&mut framed).await?;
             let payload = protocol::encode(&Request::Replicate(req))?;
             framed.send(Bytes::from(payload)).await?;
             if let Some(frame) = framed.next().await.transpose()? {
@@ -168,6 +179,37 @@ async fn replicate_once(
     }
 }
 
+async fn perform_handshake<S>(framed: &mut Framed<S, LengthDelimitedCodec>) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let handshake = Request::Handshake {
+        client_version: PROTOCOL_VERSION,
+    };
+    let payload = protocol::encode(&handshake)?;
+    framed.send(Bytes::from(payload)).await?;
+
+    let frame = framed
+        .next()
+        .await
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("no handshake response from peer"))?;
+    let response: Response = protocol::decode(&frame)?;
+    match response {
+        Response::HandshakeOk { server_version } if server_version == PROTOCOL_VERSION => Ok(()),
+        Response::HandshakeOk { server_version } => Err(anyhow::anyhow!(
+            "protocol version mismatch: server {} client {}",
+            server_version,
+            PROTOCOL_VERSION
+        )),
+        Response::Error(err) => Err(anyhow::anyhow!("handshake rejected: {err}")),
+        other => Err(anyhow::anyhow!(
+            "unexpected handshake response: {:?}",
+            other
+        )),
+    }
+}
+
 async fn replicate_with_retry(
     addr: String,
     req: ReplicateRequest,
@@ -179,7 +221,14 @@ async fn replicate_with_retry(
 ) -> bool {
     let mut attempt = 0usize;
     loop {
-        let ok = replicate_once(addr.clone(), req.clone(), timeout, peer_id.clone(), tls.clone()).await;
+        let ok = replicate_once(
+            addr.clone(),
+            req.clone(),
+            timeout,
+            peer_id.clone(),
+            tls.clone(),
+        )
+        .await;
         if ok {
             return true;
         }

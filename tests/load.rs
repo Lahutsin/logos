@@ -1,9 +1,9 @@
 use std::env;
 use std::time::Instant;
 
-use rand::{rngs::StdRng, Rng, SeedableRng};
 use logos::protocol::{Record, Response};
 use logos::sdk::Client;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 
 fn env_usize(key: &str, default: usize) -> usize {
     env::var(key)
@@ -23,7 +23,10 @@ async fn load_produce_fetch() -> anyhow::Result<()> {
 
     let addr = env::var("RK_LOAD_ADDR").unwrap_or_else(|_| "127.0.0.1:9092".to_string());
     let topic = env::var("RK_LOAD_TOPIC").unwrap_or_else(|_| "load".to_string());
-    let partition: u32 = env::var("RK_LOAD_PARTITION").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let partition: u32 = env::var("RK_LOAD_PARTITION")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let batch = env_usize("RK_LOAD_BATCH", 100);
     let payload_bytes = env_usize("RK_LOAD_PAYLOAD", 256);
     let workers = env_usize("RK_LOAD_WORKERS", 4);
@@ -44,9 +47,7 @@ async fn load_produce_fetch() -> anyhow::Result<()> {
                     value: payload.clone(),
                     timestamp: 0,
                 };
-                match client
-                    .produce(&topic, partition, vec![rec], None)
-                    .await? {
+                match client.produce(&topic, partition, vec![rec], None).await? {
                     Response::Produced { .. } => {}
                     other => anyhow::bail!("unexpected response: {:?}", other),
                 }
@@ -63,7 +64,13 @@ async fn load_produce_fetch() -> anyhow::Result<()> {
     // Fetch back a slice to ensure reads still work.
     let mut client = Client::connect(&addr).await?;
     let fetch_res = client
-        .fetch(&topic, partition, 0, (payload_bytes * batch * workers).min(2_000_000) as u32, None)
+        .fetch(
+            &topic,
+            partition,
+            0,
+            (payload_bytes * batch * workers).min(2_000_000) as u32,
+            None,
+        )
         .await?;
     match fetch_res {
         Response::Fetched { records } => {

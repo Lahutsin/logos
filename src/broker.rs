@@ -43,9 +43,19 @@ impl Broker {
             Request::Replicate(req) => self.handle_replicate(req).await,
             Request::Fetch(req) => self.handle_fetch(req).await,
             Request::Health => Response::HealthOk,
-            Request::Handshake { client_version: _ } => Response::HandshakeOk {
-                server_version: crate::protocol::PROTOCOL_VERSION,
-            },
+            Request::Handshake { client_version } => {
+                if client_version == crate::protocol::PROTOCOL_VERSION {
+                    Response::HandshakeOk {
+                        server_version: crate::protocol::PROTOCOL_VERSION,
+                    }
+                } else {
+                    Response::Error(format!(
+                        "unsupported protocol version: client {} server {}",
+                        client_version,
+                        crate::protocol::PROTOCOL_VERSION
+                    ))
+                }
+            }
         }
     }
 
@@ -58,12 +68,20 @@ impl Broker {
 
         if produce_bytes > self.max_batch_bytes {
             inc_request("produce", "too_large");
-            return Response::Error(format!("batch too large: {} bytes > limit {}", produce_bytes, self.max_batch_bytes));
+            return Response::Error(format!(
+                "batch too large: {} bytes > limit {}",
+                produce_bytes, self.max_batch_bytes
+            ));
         }
 
         if let Err(err) = self
             .authz
-            .authorize(req.auth.as_deref(), &req.topic, Action::Produce, produce_bytes)
+            .authorize(
+                req.auth.as_deref(),
+                &req.topic,
+                Action::Produce,
+                produce_bytes,
+            )
             .await
         {
             inc_request("produce", "auth_err");
@@ -81,8 +99,15 @@ impl Broker {
 
         let need_acks = self.ack_quorum.max(1);
         let followers = self.metadata.followers(&req.topic, req.partition);
-        let leader_epoch = self.metadata.leader_epoch(&req.topic, req.partition).unwrap_or(0);
-        let records_for_replication = if need_acks > 1 { Some(req.records.clone()) } else { None };
+        let leader_epoch = self
+            .metadata
+            .leader_epoch(&req.topic, req.partition)
+            .unwrap_or(0);
+        let records_for_replication = if need_acks > 1 {
+            Some(req.records.clone())
+        } else {
+            None
+        };
         let records_for_storage = req.records.clone();
 
         match self
@@ -132,17 +157,29 @@ impl Broker {
         let replicate_bytes: u64 = req
             .entries
             .iter()
-            .map(|r| r.record.key.len() as u64 + r.record.value.len() as u64 + std::mem::size_of::<i64>() as u64)
+            .map(|r| {
+                r.record.key.len() as u64
+                    + r.record.value.len() as u64
+                    + std::mem::size_of::<i64>() as u64
+            })
             .sum();
 
         if replicate_bytes > self.max_batch_bytes {
             inc_request("replicate", "too_large");
-            return Response::Error(format!("replication batch too large: {} bytes > limit {}", replicate_bytes, self.max_batch_bytes));
+            return Response::Error(format!(
+                "replication batch too large: {} bytes > limit {}",
+                replicate_bytes, self.max_batch_bytes
+            ));
         }
 
         if let Err(err) = self
             .authz
-            .authorize(req.auth.as_deref(), &req.topic, Action::Replicate, replicate_bytes)
+            .authorize(
+                req.auth.as_deref(),
+                &req.topic,
+                Action::Replicate,
+                replicate_bytes,
+            )
             .await
         {
             inc_request("replicate", "auth_err");
@@ -215,7 +252,11 @@ impl Broker {
                 inc_request("fetch", "ok");
                 let fetched_bytes: u64 = records
                     .iter()
-                    .map(|r| r.record.key.len() as u64 + r.record.value.len() as u64 + std::mem::size_of::<i64>() as u64)
+                    .map(|r| {
+                        r.record.key.len() as u64
+                            + r.record.value.len() as u64
+                            + std::mem::size_of::<i64>() as u64
+                    })
                     .sum();
                 add_bytes("fetch", fetched_bytes);
                 Response::Fetched { records }

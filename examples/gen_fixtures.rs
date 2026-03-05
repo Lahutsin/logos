@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::Path;
 
-use logos::protocol::{self, FetchRequest, FetchedRecord, ProduceRequest, Record, Request, Response};
+use logos::protocol::{
+    self, FetchRequest, FetchedRecord, ProduceRequest, Record, Request, Response,
+};
 
 fn ensure_dir(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -97,9 +99,15 @@ fn fixture_handshake_response() -> Response {
 
 fn main() -> anyhow::Result<()> {
     let req_fixtures = vec![
-        ("tests/fixtures/v1/produce_req.bin", fixture_produce_request()),
+        (
+            "tests/fixtures/v1/produce_req.bin",
+            fixture_produce_request(),
+        ),
         ("tests/fixtures/v1/fetch_req.bin", fixture_fetch_request()),
-        ("tests/fixtures/v1/handshake_req.bin", fixture_handshake_request()),
+        (
+            "tests/fixtures/v1/handshake_req.bin",
+            fixture_handshake_request(),
+        ),
     ];
 
     for (path, req) in req_fixtures {
@@ -109,10 +117,22 @@ fn main() -> anyhow::Result<()> {
 
     // Responses
     let resp_fixtures = vec![
-        ("tests/fixtures/v1/produced_resp.bin", fixture_produced_response()),
-        ("tests/fixtures/v1/fetched_resp.bin", fixture_fetched_response()),
-        ("tests/fixtures/v1/not_leader_resp.bin", fixture_not_leader_response()),
-        ("tests/fixtures/v1/handshake_resp.bin", fixture_handshake_response()),
+        (
+            "tests/fixtures/v1/produced_resp.bin",
+            fixture_produced_response(),
+        ),
+        (
+            "tests/fixtures/v1/fetched_resp.bin",
+            fixture_fetched_response(),
+        ),
+        (
+            "tests/fixtures/v1/not_leader_resp.bin",
+            fixture_not_leader_response(),
+        ),
+        (
+            "tests/fixtures/v1/handshake_resp.bin",
+            fixture_handshake_response(),
+        ),
     ];
 
     for (path, resp) in resp_fixtures {

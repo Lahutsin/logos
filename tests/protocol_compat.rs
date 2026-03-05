@@ -18,8 +18,16 @@ fn expected_produce_request() -> Request {
         topic: "compat".to_string(),
         partition: 0,
         records: vec![
-            Record { key: b"k1".to_vec(), value: b"v1".to_vec(), timestamp: 1 },
-            Record { key: b"k2".to_vec(), value: b"v2".to_vec(), timestamp: 2 },
+            Record {
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                timestamp: 1,
+            },
+            Record {
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+                timestamp: 2,
+            },
         ],
         auth: Some("token-a".to_string()),
     })
@@ -36,7 +44,11 @@ fn expected_fetch_request() -> Request {
 }
 
 fn expected_produced_response() -> Response {
-    Response::Produced { base_offset: 10, last_offset: 11, acks: 2 }
+    Response::Produced {
+        base_offset: 10,
+        last_offset: 11,
+        acks: 2,
+    }
 }
 
 fn expected_fetched_response() -> Response {
@@ -44,26 +56,40 @@ fn expected_fetched_response() -> Response {
         records: vec![
             FetchedRecord {
                 offset: 10,
-                record: Record { key: b"k1".to_vec(), value: b"v1".to_vec(), timestamp: 1 },
+                record: Record {
+                    key: b"k1".to_vec(),
+                    value: b"v1".to_vec(),
+                    timestamp: 1,
+                },
             },
             FetchedRecord {
                 offset: 11,
-                record: Record { key: b"k2".to_vec(), value: b"v2".to_vec(), timestamp: 2 },
+                record: Record {
+                    key: b"k2".to_vec(),
+                    value: b"v2".to_vec(),
+                    timestamp: 2,
+                },
             },
         ],
     }
 }
 
 fn expected_not_leader_response() -> Response {
-    Response::NotLeader { leader: Some("node-x".to_string()) }
+    Response::NotLeader {
+        leader: Some("node-x".to_string()),
+    }
 }
 
 fn expected_handshake_request() -> Request {
-    Request::Handshake { client_version: protocol::PROTOCOL_VERSION }
+    Request::Handshake {
+        client_version: protocol::PROTOCOL_VERSION,
+    }
 }
 
 fn expected_handshake_response() -> Response {
-    Response::HandshakeOk { server_version: protocol::PROTOCOL_VERSION }
+    Response::HandshakeOk {
+        server_version: protocol::PROTOCOL_VERSION,
+    }
 }
 
 #[test]
@@ -140,7 +166,8 @@ fn encode_handshake_request_matches_fixture() {
 
 #[test]
 fn decode_handshake_response_v1() {
-    let resp: Response = protocol::decode(fixture("handshake_resp")).expect("decode handshake resp");
+    let resp: Response =
+        protocol::decode(fixture("handshake_resp")).expect("decode handshake resp");
     assert_eq!(expected_handshake_response(), resp);
 }
 

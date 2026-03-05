@@ -63,11 +63,21 @@ pub struct FetchedRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Response {
-    Produced { base_offset: Offset, last_offset: Offset, acks: u32 },
-    Fetched { records: Vec<FetchedRecord> },
+    Produced {
+        base_offset: Offset,
+        last_offset: Offset,
+        acks: u32,
+    },
+    Fetched {
+        records: Vec<FetchedRecord>,
+    },
     HealthOk,
-    HandshakeOk { server_version: u16 },
-    NotLeader { leader: Option<String> },
+    HandshakeOk {
+        server_version: u16,
+    },
+    NotLeader {
+        leader: Option<String>,
+    },
     Error(String),
 }
 

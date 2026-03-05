@@ -41,15 +41,15 @@ pub fn inc_request(kind: &str, status: &str) {
 }
 
 pub fn add_bytes(direction: &str, val: u64) {
-    METRICS.bytes
-        .with_label_values(&[direction])
-    .inc_by(val);
+    METRICS.bytes.with_label_values(&[direction]).inc_by(val);
 }
 
 pub fn render_prometheus() -> String {
     let encoder = TextEncoder::new();
     let metric_families = METRICS.registry.gather();
     let mut buf = String::new();
-    encoder.encode_utf8(&metric_families, &mut buf).expect("encode metrics");
+    encoder
+        .encode_utf8(&metric_families, &mut buf)
+        .expect("encode metrics");
     buf
 }

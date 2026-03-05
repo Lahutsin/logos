@@ -28,6 +28,10 @@ spec:
           {{- $requireTls := or $prod .Values.env.requireTls }}
           {{- $requireAuth := or $prod .Values.env.requireAuth }}
           {{- $authPath := (default (printf "%s/%s" .Values.auth.mountPath .Values.auth.secretKey) .Values.env.authPath) }}
+          {{- $adminTokenInline := trim .Values.env.adminToken }}
+          {{- if and (not .Values.adminTokenSecret.name) (empty $adminTokenInline) }}
+          {{- fail "Admin token is required: set adminTokenSecret.name or env.adminToken" }}
+          {{- end }}
           env:
             - name: RK_BIND_ADDR
               value: {{ .Values.env.bindAddr | quote }}
@@ -89,7 +93,14 @@ spec:
             - name: RK_REQUIRE_AUTH
               value: {{ $requireAuth | quote }}
             - name: RK_ADMIN_TOKEN
+              {{- if .Values.adminTokenSecret.name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.adminTokenSecret.name }}
+                  key: {{ .Values.adminTokenSecret.key }}
+              {{- else }}
               value: {{ .Values.env.adminToken | quote }}
+              {{- end }}
             {{- range .Values.extraEnv }}
             - name: {{ .name }}
               value: {{ .value | quote }}
@@ -101,13 +112,13 @@ spec:
               containerPort: {{ .Values.service.adminPort }}
           livenessProbe:
             httpGet:
-              path: /metrics
+              path: /healthz
               port: admin
             initialDelaySeconds: 10
             periodSeconds: 15
           readinessProbe:
             httpGet:
-              path: /metrics
+              path: /healthz
               port: admin
             initialDelaySeconds: 5
             periodSeconds: 10

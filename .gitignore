@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target/
+
+# macOS
+.DS_Store
+
+# Editor settings
+.vscode/
+.idea/
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
