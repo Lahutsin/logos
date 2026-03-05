@@ -67,6 +67,46 @@ class Program
         return ms.ToArray();
     }
 
+    static byte[] BuildFetchPayload(
+        string topic,
+        uint partition,
+        ulong offset,
+        uint maxBytes,
+        string? authToken)
+    {
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms);
+
+        // Request::Fetch variant index (see protocol.rs order)
+        bw.Write((uint)2);
+
+        // topic: String (u64 len + bytes)
+        var topicBytes = System.Text.Encoding.UTF8.GetBytes(topic);
+        bw.Write((ulong)topicBytes.Length);
+        bw.Write(topicBytes);
+
+        // partition: u32, offset: u64, max_bytes: u32
+        bw.Write(partition);
+        bw.Write(offset);
+        bw.Write(maxBytes);
+
+        // auth: Option<String> (u8 tag then string if Some)
+        if (authToken is null)
+        {
+            bw.Write((byte)0); // None
+        }
+        else
+        {
+            bw.Write((byte)1); // Some
+            var authBytes = System.Text.Encoding.UTF8.GetBytes(authToken);
+            bw.Write((ulong)authBytes.Length);
+            bw.Write(authBytes);
+        }
+
+        bw.Flush();
+        return ms.ToArray();
+    }
+
     static void SendFrame(NetworkStream stream, byte[] payload)
     {
         Span<byte> lenBuf = stackalloc byte[4];
@@ -119,5 +159,16 @@ class Program
         SendFrame(stream, prodPayload);
         var prod = RecvFrame(stream);
         Console.WriteLine("produce resp=" + Convert.ToHexString(prod));
+
+        // Build a Fetch request from offset 0 for the same topic/partition.
+        var fetchPayload = BuildFetchPayload(
+            topic: "compat",
+            partition: 0,
+            offset: 0,
+            maxBytes: 1024 * 1024,
+            authToken: "token-a");
+        SendFrame(stream, fetchPayload);
+        var fetched = RecvFrame(stream);
+        Console.WriteLine("fetch resp=" + Convert.ToHexString(fetched));
     }
 }

@@ -83,6 +83,25 @@ func buildProduce(topic string, partition uint32, records []record, auth *string
     return buf.Bytes()
 }
 
+func buildFetch(topic string, partition uint32, offset uint64, maxBytes uint32, auth *string) []byte {
+    var buf bytes.Buffer
+    binary.Write(&buf, binary.LittleEndian, uint32(2)) // variant index for Fetch
+
+    writeString(&buf, topic)
+    binary.Write(&buf, binary.LittleEndian, partition)
+    binary.Write(&buf, binary.LittleEndian, offset)
+    binary.Write(&buf, binary.LittleEndian, maxBytes)
+
+    if auth == nil {
+        buf.WriteByte(0) // Option::None
+    } else {
+        buf.WriteByte(1) // Option::Some
+        writeString(&buf, *auth)
+    }
+
+    return buf.Bytes()
+}
+
 func main() {
     host := os.Getenv("LOGOS_HOST")
     if host == "" {
@@ -122,4 +141,14 @@ func main() {
         panic(err)
     }
     fmt.Printf("produce resp=%x\n", prodResp)
+
+    fetch := buildFetch("compat", 0, 0, 1024*1024, &auth)
+    if err := sendFrame(conn, fetch); err != nil {
+        panic(err)
+    }
+    fetchResp, err := recvFrame(conn)
+    if err != nil {
+        panic(err)
+    }
+    fmt.Printf("fetch resp=%x\n", fetchResp)
 }

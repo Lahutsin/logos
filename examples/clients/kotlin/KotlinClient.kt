@@ -64,6 +64,25 @@ private fun buildProduce(topic: String, partition: Int, records: List<Rec>, auth
     return out.toByteArray()
 }
 
+private fun buildFetch(topic: String, partition: Int, offset: Long, maxBytes: Int, auth: String?): ByteArray {
+    val out = ByteArrayOutputStream()
+    writeU32LE(out, 2) // variant index for Fetch
+
+    writeString(out, topic)
+    writeU32LE(out, partition.toLong())
+    writeU64LE(out, offset)
+    writeU32LE(out, maxBytes.toLong())
+
+    if (auth == null) {
+        out.write(0) // Option::None
+    } else {
+        out.write(1) // Option::Some
+        writeString(out, auth)
+    }
+
+    return out.toByteArray()
+}
+
 fun sendFrame(out: DataOutputStream, payload: ByteArray) {
     val len = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(payload.size).array()
     out.write(len)
@@ -102,5 +121,16 @@ fun main() {
         sendFrame(out, prodPayload)
         val prod = recvFrame(`in`)
         println("produce resp=${HexFormat.of().formatHex(prod)}")
+
+        val fetchPayload = buildFetch(
+            topic = "compat",
+            partition = 0,
+            offset = 0,
+            maxBytes = 1024 * 1024,
+            auth = "token-a"
+        )
+        sendFrame(out, fetchPayload)
+        val fetched = recvFrame(`in`)
+        println("fetch resp=${HexFormat.of().formatHex(fetched)}")
     }
 }

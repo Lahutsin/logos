@@ -84,6 +84,28 @@ Responses:
 - `NotLeader { leader: Option<String> }`
 - `Error(String)`
 
+## Produce and consume flow
+```mermaid
+flowchart LR
+    P[Producer client] -->|1. Handshake| B[Broker]
+    P -->|2. Produce topic/partition/records| B
+    B -->|3. Auth and leader check| B
+    B -->|4. Append on leader WAL| L[(Leader log)]
+    B -->|5. Replicate to followers when acks > 1| F[(Follower logs)]
+    B -->|6. Produced base_offset/last_offset/acks| P
+
+    C[Consumer client] -->|7. Fetch topic/partition/offset/max_bytes| B
+    B -->|8. Read records from log| L
+    B -->|9. Fetched records| C
+    C -->|10. Next fetch from last_offset + 1| C
+```
+
+Producer/consumer request loop:
+- Producer sends `Produce`; broker validates auth, checks leadership, appends locally, optionally replicates, then returns `Produced`.
+- Consumer sends `Fetch` with current offset; broker returns `Fetched { records }` from that offset onward.
+- Consumer updates its next offset to `last_seen_offset + 1` and repeats fetch.
+- On `NotLeader`, reconnect to the suggested leader and retry produce/fetch on that node.
+
 ## Client semantics
 - Producers: with `acks >= 2` the write is confirmed after the leader and at least one follower persist it; ordering is per-partition; no idempotence (retries can duplicate).
 - Fetch: returns bytes on the node you hit; commit watermark is for recovery, not filtering. Clients must follow leaders (on `NotLeader`) and de-duplicate during leader changes.

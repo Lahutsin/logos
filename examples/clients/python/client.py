@@ -43,6 +43,24 @@ def build_produce(topic: str, partition: int, records: list[tuple[bytes, bytes, 
     return bytes(buf)
 
 
+def build_fetch(topic: str, partition: int, offset: int, max_bytes: int, auth: str | None) -> bytes:
+    buf = bytearray()
+    buf += struct.pack("<I", 2)  # variant index for Fetch
+
+    write_string(buf, topic)
+    buf += struct.pack("<I", partition)
+    buf += struct.pack("<Q", offset)
+    buf += struct.pack("<I", max_bytes)
+
+    if auth is None:
+        buf += b"\x00"  # Option::None
+    else:
+        buf += b"\x01"  # Option::Some
+        write_string(buf, auth)
+
+    return bytes(buf)
+
+
 def send_frame(sock: socket.socket, payload: bytes) -> None:
     sock.sendall(struct.pack(">I", len(payload)) + payload)
 
@@ -82,6 +100,17 @@ def main() -> None:
         send_frame(sock, prod_payload)
         prod = recv_frame(sock)
         print(f"produce resp={prod.hex()}")
+
+        fetch_payload = build_fetch(
+            topic="compat",
+            partition=0,
+            offset=0,
+            max_bytes=1024 * 1024,
+            auth="token-a",
+        )
+        send_frame(sock, fetch_payload)
+        fetched = recv_frame(sock)
+        print(f"fetch resp={fetched.hex()}")
 
 
 if __name__ == "__main__":

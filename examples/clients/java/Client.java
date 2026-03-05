@@ -81,6 +81,25 @@ public class Client {
         return out.toByteArray();
     }
 
+    private static byte[] buildFetch(String topic, int partition, long offset, int maxBytes, String auth) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        writeU32LE(out, 2); // variant index for Fetch
+
+        writeString(out, topic);
+        writeU32LE(out, partition);
+        writeU64LE(out, offset);
+        writeU32LE(out, maxBytes);
+
+        if (auth == null) {
+            out.write(0); // Option::None
+        } else {
+            out.write(1); // Option::Some
+            writeString(out, auth);
+        }
+
+        return out.toByteArray();
+    }
+
     private static void sendFrame(DataOutputStream out, byte[] payload) throws IOException {
         ByteBuffer buf = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN);
         buf.putInt(payload.length);
@@ -120,6 +139,11 @@ public class Client {
             sendFrame(out, producePayload);
             byte[] producedResp = recvFrame(in);
             System.out.println("produce resp=" + HexFormat.of().formatHex(producedResp));
+
+            byte[] fetchPayload = buildFetch("compat", 0, 0L, 1024 * 1024, "token-a");
+            sendFrame(out, fetchPayload);
+            byte[] fetchedResp = recvFrame(in);
+            System.out.println("fetch resp=" + HexFormat.of().formatHex(fetchedResp));
         }
     }
 }
