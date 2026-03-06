@@ -159,6 +159,11 @@ impl Broker {
     }
 
     async fn handle_replicate(&self, req: crate::protocol::ReplicateRequest) -> Response {
+        if req.entries.is_empty() {
+            inc_request("replicate", "empty");
+            return Response::Error("empty replicate batch".to_string());
+        }
+
         let replicate_bytes: u64 = req
             .entries
             .iter()
@@ -279,7 +284,7 @@ impl Broker {
 mod tests {
     use super::*;
     use crate::metadata::Metadata;
-    use crate::protocol::{ProduceRequest, Request};
+    use crate::protocol::{ProduceRequest, ReplicateRequest, Request};
     use crate::replication::Replicator;
     use tempfile::tempdir;
 
@@ -309,6 +314,38 @@ mod tests {
 
         match response {
             Response::Error(msg) => assert!(msg.contains("empty produce batch")),
+            other => panic!("expected error response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn replicate_rejects_empty_batch() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path(), 1024 * 1024, None, None, 16, false).unwrap();
+        let metadata = Arc::new(Metadata::single_node("node-1".to_string()));
+        let authz = Authz::load(None).unwrap();
+        let broker = Broker::new(
+            storage,
+            Replicator::disabled(),
+            metadata,
+            1,
+            authz,
+            4 * 1024 * 1024,
+        );
+
+        let response = broker
+            .handle(Request::Replicate(ReplicateRequest {
+                leader_id: "node-2".to_string(),
+                leader_epoch: 1,
+                topic: "topic".to_string(),
+                partition: 0,
+                entries: Vec::new(),
+                auth: None,
+            }))
+            .await;
+
+        match response {
+            Response::Error(msg) => assert!(msg.contains("empty replicate batch")),
             other => panic!("expected error response, got {other:?}"),
         }
     }

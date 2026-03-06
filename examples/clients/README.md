@@ -9,6 +9,7 @@ Flow
 	- `records` must be non-empty; the broker rejects empty produce batches.
 - Send `Fetch { topic: "compat", partition: 0, offset: 0, max_bytes: 1048576, auth: token-a }` → read response.
 	- `Fetch` returns records from the requested offset on the node you connect to.
+	- After compaction, offsets can be sparse, so a fetch from a removed offset resumes at the next visible record.
 - Override host/port with `LOGOS_HOST` / `LOGOS_PORT` (defaults `127.0.0.1:9092`).
 
 End-to-end flow diagram (produce -> consume)
@@ -29,7 +30,7 @@ flowchart LR
 
 Redirect and retry behavior
 - If `Produce` or `Fetch` returns `NotLeader { leader }`, reconnect to the reported leader and retry.
-- Consumers should keep track of the last consumed offset and increment it between fetch calls.
+- Consumers should keep track of the last consumed offset and increment it between fetch calls; do not assume every intermediate offset still exists after compaction.
 - With `RK_REPLICATION_ACKS >= 2`, producer ack waits for leader + follower durability.
 
 Broker setup
@@ -75,4 +76,5 @@ go run ./examples/clients/go
 
 Notes
 - These clients construct payloads directly; protocol fixtures remain under [tests/fixtures/v1](tests/fixtures/v1) for compatibility tests and for regenerating via `cargo run --quiet --example gen_fixtures`.
+- `Replicate` is an internal broker-to-broker request; if you implement it outside Rust, `entries` must be non-empty.
 - For production, use an SDK that manages auth tokens and TLS instead of these minimal examples.

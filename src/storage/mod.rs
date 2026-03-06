@@ -18,6 +18,8 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]
     Serialization(#[from] bincode::Error),
+    #[error("empty record batch")]
+    EmptyBatch,
     #[error("invalid topic name: '{0}'")]
     InvalidTopic(String),
     #[error("topic '{topic}' partition {partition} not found")]
@@ -493,8 +495,7 @@ impl Log {
 
     fn append_batch(&mut self, records: Vec<Record>) -> StorageResult<(Offset, Offset)> {
         if records.is_empty() {
-            let last = self.active.next_offset.saturating_sub(1);
-            return Ok((self.active.next_offset, last));
+            return Err(StorageError::EmptyBatch);
         }
 
         let batch_start = self.active.next_offset;
@@ -527,6 +528,8 @@ impl Log {
             return Ok(Vec::new());
         }
 
+        // After compaction offsets can be sparse; fetch returns the first visible
+        // record at or after the requested offset.
         let mut out = Vec::new();
         let mut remaining = max_bytes as u64;
         let mut blocked_on_earliest = false;
@@ -566,8 +569,7 @@ impl Log {
         records: &[(Offset, Record)],
     ) -> StorageResult<(Offset, Offset)> {
         if records.is_empty() {
-            let last = self.active.next_offset.saturating_sub(1);
-            return Ok((self.active.next_offset, last));
+            return Err(StorageError::EmptyBatch);
         }
 
         let batch_start = records
@@ -1426,6 +1428,20 @@ mod tests {
     }
 
     #[test]
+    fn empty_batches_are_rejected() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path(), 1024 * 1024, None, None, 16, false).unwrap();
+
+        let err = storage.append("topic", 0, Vec::new()).unwrap_err();
+        assert!(matches!(err, StorageError::EmptyBatch));
+
+        let err = storage
+            .append_with_offsets("topic", 0, Vec::new())
+            .unwrap_err();
+        assert!(matches!(err, StorageError::EmptyBatch));
+    }
+
+    #[test]
     fn rejects_invalid_topic_names() {
         let dir = tempdir().unwrap();
         let storage = Storage::open(dir.path(), 1024 * 1024, None, None, 16, false).unwrap();
@@ -1650,6 +1666,48 @@ mod tests {
         assert_eq!(fetched[1].record.key, b"k3".to_vec());
         assert_eq!(fetched[0].offset, 1);
         assert_eq!(fetched[1].offset, 3);
+    }
+
+    #[test]
+    fn fetch_from_compaction_gap_returns_next_visible_offset() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path(), 1024 * 1024, None, None, 16, false).unwrap();
+
+        storage
+            .append(
+                "topic",
+                0,
+                vec![
+                    Record {
+                        key: b"k1".to_vec(),
+                        value: b"v1".to_vec(),
+                        timestamp: 1,
+                    },
+                    Record {
+                        key: b"k2".to_vec(),
+                        value: b"v2".to_vec(),
+                        timestamp: 2,
+                    },
+                    Record {
+                        key: b"k1".to_vec(),
+                        value: Vec::new(),
+                        timestamp: 3,
+                    },
+                    Record {
+                        key: b"k3".to_vec(),
+                        value: b"v3".to_vec(),
+                        timestamp: 4,
+                    },
+                ],
+            )
+            .unwrap();
+
+        storage.compact("topic", 0).unwrap();
+
+        let fetched = storage.fetch("topic", 0, 2, 1024 * 1024).unwrap();
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].offset, 3);
+        assert_eq!(fetched[0].record.key, b"k3".to_vec());
     }
 
     #[test]

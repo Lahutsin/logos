@@ -77,6 +77,8 @@ Requests:
 - `Replicate { leader_id, leader_epoch, topic, partition, entries, auth? }`
 - `Health`
 
+`Produce.records` and `Replicate.entries` must be non-empty; the broker rejects empty batches.
+
 Responses:
 - `HandshakeOk { server_version: u16 }`
 - `Produced { base_offset, last_offset, acks }`
@@ -103,12 +105,13 @@ flowchart LR
 Producer/consumer request loop:
 - Producer sends `Produce`; broker validates auth, checks leadership, appends locally, optionally replicates, then returns `Produced`.
 - Consumer sends `Fetch` with current offset; broker returns `Fetched { records }` from that offset onward.
+- After compaction, offsets can be sparse; if the requested offset was removed, `Fetch` returns the next visible record at or above that offset.
 - Consumer updates its next offset to `last_seen_offset + 1` and repeats fetch.
 - On `NotLeader`, reconnect to the suggested leader and retry produce/fetch on that node.
 
 ## Client semantics
 - Producers: with `acks >= 2` the write is confirmed after the leader and at least one follower persist it; ordering is per-partition; no idempotence (retries can duplicate).
-- Fetch: returns bytes on the node you hit; commit watermark is for recovery, not filtering. Clients must follow leaders (on `NotLeader`) and de-duplicate during leader changes.
+- Fetch: returns bytes on the node you hit; commit watermark is for recovery, not filtering. After compaction, clients can observe sparse offsets and should advance from the last returned offset rather than assuming contiguity. Clients must follow leaders (on `NotLeader`) and de-duplicate during leader changes.
 - Redirects/retries: on `NotLeader` reconnect to the suggested leader; on `Error("fenced")` refresh metadata/epochs.
 - Security: when auth is enabled, all requests must include a token in `auth`; quotas cap bytes over 1s windows.
 
