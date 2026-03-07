@@ -5,8 +5,8 @@ use crate::metadata::Metadata;
 use crate::metrics::{add_bytes, inc_request};
 use crate::protocol::{
     CommitOffsetRequest, FetchRequest, GroupFetchRequest, HeartbeatRequest, JoinGroupRequest,
-    LeaveGroupRequest, ProduceRequest, ReplicaRecord, Request, Response,
-    ValidateGroupFetchRequest,
+    LeaveGroupRequest, ProduceRequest, ReplicaRecord, ReplicateCoordinatorStateRequest,
+    ReplicatedConsumerGroupState, Request, Response, ValidateGroupFetchRequest,
 };
 use crate::replication::Replicator;
 use crate::security::{Action, Authz};
@@ -34,19 +34,23 @@ impl Broker {
         max_batch_bytes: u64,
         consumer_group_heartbeat_ms: u64,
         consumer_group_session_timeout_ms: u64,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        let consumer_groups = ConsumerGroupCoordinator::persistent(
+            storage.consumer_group_log_path(),
+            metadata.self_id().to_string(),
+            consumer_group_heartbeat_ms,
+            consumer_group_session_timeout_ms,
+        )?;
+
+        Ok(Self {
             storage,
             metadata,
             ack_quorum: ack_quorum.max(1),
             replicator,
             authz,
             max_batch_bytes,
-            consumer_groups: ConsumerGroupCoordinator::new(
-                consumer_group_heartbeat_ms,
-                consumer_group_session_timeout_ms,
-            ),
-        }
+            consumer_groups,
+        })
     }
 
     pub async fn handle(&self, request: Request) -> Response {
@@ -60,6 +64,9 @@ impl Broker {
             Request::GroupFetch(req) => self.handle_group_fetch(req).await,
             Request::LeaveGroup(req) => self.handle_leave_group(req).await,
             Request::ValidateGroupFetch(req) => self.handle_validate_group_fetch(req).await,
+            Request::ReplicateCoordinatorState(req) => {
+                self.handle_replicate_coordinator_state(req).await
+            }
             Request::Health => Response::HealthOk,
             Request::Handshake { client_version } => {
                 if client_version == crate::protocol::PROTOCOL_VERSION {
@@ -105,8 +112,12 @@ impl Broker {
                 return response;
             }
         };
+        let previous_version = self
+            .consumer_groups
+            .export_group_state(&req.group_id)
+            .map(|state| state.version);
 
-        match self
+        let response = match self
             .consumer_groups
             .join(&req.group_id, &req.topic, req.member_id.as_deref(), &partitions)
         {
@@ -118,12 +129,23 @@ impl Broker {
                     generation: joined.generation,
                     heartbeat_interval_ms: joined.heartbeat_interval_ms,
                     session_timeout_ms: joined.session_timeout_ms,
-                    assignments: joined.assignments,
+                    assignments: self.enrich_assignments(joined.assignments),
                 }
             }
             Err(err) => {
                 inc_request("join_group", "error");
                 self.group_error_response(&req.group_id, err)
+            }
+        };
+
+        match self
+            .replicate_group_state_if_changed(&req.group_id, previous_version)
+            .await
+        {
+            Ok(()) => response,
+            Err(replication_error) => {
+                inc_request("join_group", "replication_err");
+                replication_error
             }
         }
     }
@@ -156,8 +178,12 @@ impl Broker {
                 return response;
             }
         };
+        let previous_version = self
+            .consumer_groups
+            .export_group_state(&req.group_id)
+            .map(|state| state.version);
 
-        match self.consumer_groups.heartbeat(
+        let response = match self.consumer_groups.heartbeat(
             &req.group_id,
             &req.topic,
             &req.member_id,
@@ -175,6 +201,17 @@ impl Broker {
             Err(err) => {
                 inc_request("heartbeat", "error");
                 self.group_error_response(&req.group_id, err)
+            }
+        };
+
+        match self
+            .replicate_group_state_if_changed(&req.group_id, previous_version)
+            .await
+        {
+            Ok(()) => response,
+            Err(replication_error) => {
+                inc_request("heartbeat", "replication_err");
+                replication_error
             }
         }
     }
@@ -207,8 +244,12 @@ impl Broker {
                 return response;
             }
         };
+        let previous_version = self
+            .consumer_groups
+            .export_group_state(&req.group_id)
+            .map(|state| state.version);
 
-        match self.consumer_groups.commit_offset(
+        let response = match self.consumer_groups.commit_offset(
             &req.group_id,
             &req.topic,
             &req.member_id,
@@ -231,6 +272,17 @@ impl Broker {
             Err(err) => {
                 inc_request("commit_offset", "error");
                 self.group_error_response(&req.group_id, err)
+            }
+        };
+
+        match self
+            .replicate_group_state_if_changed(&req.group_id, previous_version)
+            .await
+        {
+            Ok(()) => response,
+            Err(replication_error) => {
+                inc_request("commit_offset", "replication_err");
+                replication_error
             }
         }
     }
@@ -263,8 +315,12 @@ impl Broker {
                 return response;
             }
         };
+        let previous_version = self
+            .consumer_groups
+            .export_group_state(&req.group_id)
+            .map(|state| state.version);
 
-        match self.consumer_groups.leave(
+        let response = match self.consumer_groups.leave(
             &req.group_id,
             &req.topic,
             &req.member_id,
@@ -282,6 +338,17 @@ impl Broker {
             Err(err) => {
                 inc_request("leave_group", "error");
                 self.group_error_response(&req.group_id, err)
+            }
+        };
+
+        match self
+            .replicate_group_state_if_changed(&req.group_id, previous_version)
+            .await
+        {
+            Ok(()) => response,
+            Err(replication_error) => {
+                inc_request("leave_group", "replication_err");
+                replication_error
             }
         }
     }
@@ -314,8 +381,12 @@ impl Broker {
                 return response;
             }
         };
+        let previous_version = self
+            .consumer_groups
+            .export_group_state(&req.group_id)
+            .map(|state| state.version);
 
-        match self.consumer_groups.authorize_fetch(
+        let response = match self.consumer_groups.authorize_fetch(
             &req.group_id,
             &req.topic,
             &req.member_id,
@@ -326,16 +397,60 @@ impl Broker {
             Ok(()) => {
                 inc_request("validate_group_fetch", "ok");
                 Response::GroupFetchAuthorized {
-                    group_id: req.group_id,
-                    member_id: req.member_id,
+                    group_id: req.group_id.clone(),
+                    member_id: req.member_id.clone(),
                     generation: req.generation,
-                    topic: req.topic,
+                    topic: req.topic.clone(),
                     partition: req.partition,
                 }
             }
             Err(err) => {
                 inc_request("validate_group_fetch", "error");
                 self.group_error_response(&req.group_id, err)
+            }
+        };
+
+        match self
+            .replicate_group_state_if_changed(&req.group_id, previous_version)
+            .await
+        {
+            Ok(()) => response,
+            Err(replication_error) => {
+                inc_request("validate_group_fetch", "replication_err");
+                replication_error
+            }
+        }
+    }
+
+    async fn handle_replicate_coordinator_state(
+        &self,
+        req: ReplicateCoordinatorStateRequest,
+    ) -> Response {
+        if let Err(err) = self
+            .authz
+            .authorize(req.auth.as_deref(), &req.state.topic, Action::Replicate, 0)
+            .await
+        {
+            inc_request("replicate_coordinator_state", "auth_err");
+            return Response::Error(format!("auth failed: {err}"));
+        }
+
+        let group_id = req.state.group_id.clone();
+        let version = req.state.version;
+        match self.consumer_groups.apply_replicated_state(req.state) {
+            Ok(_) => {
+                inc_request("replicate_coordinator_state", "ok");
+                Response::CoordinatorStateReplicated { group_id, version }
+            }
+            Err(GroupError::Persistence(err)) => {
+                inc_request("replicate_coordinator_state", "error");
+                Response::Error(format!("consumer group persistence failed: {err}"))
+            }
+            Err(err) => {
+                inc_request("replicate_coordinator_state", "error");
+                Response::Error(format!(
+                    "invalid replicated consumer group state for '{group_id}': {err:?}"
+                ))
             }
         }
     }
@@ -642,6 +757,9 @@ impl Broker {
             GroupError::InvalidRequest(field) => {
                 Response::Error(format!("invalid consumer group request: {field}"))
             }
+            GroupError::Persistence(err) => {
+                Response::Error(format!("consumer group persistence failed: {err}"))
+            }
         }
     }
 
@@ -718,6 +836,82 @@ impl Broker {
             .consumer_group_coordinator(group_id)
             .unwrap_or_else(|| self.metadata.self_id().to_string())
     }
+
+    fn enrich_assignments(
+        &self,
+        assignments: Vec<crate::protocol::ConsumerGroupAssignment>,
+    ) -> Vec<crate::protocol::ConsumerGroupAssignment> {
+        assignments
+            .into_iter()
+            .map(|mut assignment| {
+                assignment.leader_hint = self.assignment_leader_hint(&assignment.topic, assignment.partition);
+                assignment
+            })
+            .collect()
+    }
+
+    fn assignment_leader_hint(&self, topic: &str, partition: u32) -> Option<String> {
+        let leader = self.metadata.leader(topic, partition)?;
+        self.metadata.address(&leader).or(Some(leader))
+    }
+
+    async fn replicate_group_state_if_changed(
+        &self,
+        group_id: &str,
+        previous_version: Option<u64>,
+    ) -> Result<(), Response> {
+        let Some(state) = self.consumer_groups.export_group_state(group_id) else {
+            return Ok(());
+        };
+
+        if previous_version == Some(state.version) {
+            return Ok(());
+        }
+
+        self.replicate_group_state(&state).await.map_err(|err| {
+            Response::Error(format!("consumer group state replication failed: {err}"))
+        })
+    }
+
+    async fn replicate_group_state(
+        &self,
+        state: &ReplicatedConsumerGroupState,
+    ) -> anyhow::Result<()> {
+        let auth = self.replicator.internal_auth_token();
+        for node_id in self.metadata.node_ids() {
+            if node_id == self.metadata.self_id() {
+                continue;
+            }
+
+            let response = self
+                .replicator
+                .send_request_to_node(
+                    &node_id,
+                    Request::ReplicateCoordinatorState(ReplicateCoordinatorStateRequest {
+                        state: state.clone(),
+                        auth: auth.clone(),
+                    }),
+                )
+                .await?;
+
+            match response {
+                Response::CoordinatorStateReplicated { group_id, version }
+                    if group_id == state.group_id && version == state.version => {}
+                Response::Error(err) => {
+                    anyhow::bail!(
+                        "peer '{node_id}' rejected coordinator state replication: {err}"
+                    );
+                }
+                other => {
+                    anyhow::bail!(
+                        "peer '{node_id}' returned unexpected coordinator replication response: {other:?}"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -746,7 +940,8 @@ mod tests {
             4 * 1024 * 1024,
             3_000,
             15_000,
-        );
+        )
+        .unwrap();
 
         let response = broker
             .handle(Request::Produce(ProduceRequest {
@@ -778,7 +973,8 @@ mod tests {
             4 * 1024 * 1024,
             3_000,
             15_000,
-        );
+        )
+        .unwrap();
 
         let response = broker
             .handle(Request::Replicate(ReplicateRequest {
@@ -812,7 +1008,8 @@ mod tests {
             4 * 1024 * 1024,
             3_000,
             15_000,
-        );
+        )
+        .unwrap();
 
         let produced = broker
             .handle(Request::Produce(ProduceRequest {
@@ -846,6 +1043,7 @@ mod tests {
                 assert_eq!(1, assignments.len());
                 assert_eq!(0, assignments[0].partition);
                 assert_eq!(0, assignments[0].offset);
+                assert!(assignments[0].leader_hint.is_none());
                 (member_id, generation)
             }
             other => panic!("unexpected join response: {other:?}"),

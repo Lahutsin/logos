@@ -98,6 +98,8 @@ Responses:
 - `RebalanceRequired { group_id, generation }`
 - `GroupLeft { group_id, member_id, generation }`
 
+`GroupJoined.assignments` contain `{ topic, partition, offset, leader_hint? }`. When metadata is configured, `leader_hint` is the broker address for the current partition leader so consumers can connect directly for `GroupFetch`.
+
 ## Produce and consume flow
 ```mermaid
 flowchart LR
@@ -123,18 +125,20 @@ Producer/consumer request loop:
 
 ## Consumer groups
 - Consumer groups are pull-based. Members still fetch explicitly, but the broker now assigns topic partitions to a single member at a time and rejects `GroupFetch`/`CommitOffset` for non-owners.
-- Group lifecycle: `JoinGroup` returns `member_id`, `generation`, heartbeat/session timers, and assigned `{ topic, partition, offset }` tuples. Consumers should fetch from those offsets, commit `last_processed_offset + 1`, keep sending `Heartbeat`, and call `LeaveGroup` during graceful shutdown.
+- Group lifecycle: `JoinGroup` returns `member_id`, `generation`, heartbeat/session timers, and assigned `{ topic, partition, offset, leader_hint? }` tuples. Consumers should fetch from those offsets, prefer `leader_hint` when present, commit `last_processed_offset + 1`, keep sending `Heartbeat`, and call `LeaveGroup` during graceful shutdown.
 - Coordinator selection is cluster-wide: every broker hashes `group_id` over the known node IDs and forwards `JoinGroup`, `Heartbeat`, `CommitOffset`, and `LeaveGroup` to the same coordinator node. That gives the cluster one shared in-memory coordinator state per group without requiring all partitions to live on one leader.
 - `GroupFetch` can be sent to any broker that hosts the partition data. If that broker is not the group coordinator, it validates ownership remotely against the coordinator before serving records.
+- Coordinator state is appended to `RK_DATA_DIR/__logos_internal/consumer-groups.log` as JSONL records and replicated to the other known nodes on membership, heartbeat, fetch-ownership cleanup, and offset changes. On restart, a node replays the log to restore generations, members, and committed offsets.
 - If heartbeats stop for longer than `RK_CONSUMER_GROUP_SESSION_TIMEOUT_MS`, the broker evicts that member and rebalances the partitions among the remaining members.
 - On `RebalanceRequired { generation }`, the client must rejoin the group and use the new generation before fetching or committing again.
-- Current limitation: coordinator state is shared logically through the selected coordinator node, but it is still in-memory only. If that node restarts, members must rejoin and any unflushed committed offsets are lost.
+- If cluster metadata changes and the `group_id` hashes to a different node, that new coordinator can continue from the replicated log as long as it has already received the latest state records. This is replicated durability, not a consensus protocol, so treat it as failover-friendly rather than exactly-once/global-commit semantics.
 - In single-node mode, if a topic has not been created yet, the coordinator assumes partition `0` for initial assignment so a worker can join before the first produce.
 
 ## Client semantics
 - Producers: with `acks >= 2` the write is confirmed after the leader and at least one follower persist it; ordering is per-partition; no idempotence (retries can duplicate).
 - Fetch: returns bytes on the node you hit; commit watermark is for recovery, not filtering. After compaction, clients can observe sparse offsets and should advance from the last returned offset rather than assuming contiguity. Clients must follow leaders (on `NotLeader`) and de-duplicate during leader changes.
 - Consumer groups: ownership is enforced per partition and generation. Exactly-once delivery is still not provided; consumers should keep handlers idempotent because restarts and rebalances can replay records after the last committed offset.
+- Consumer groups: committed offsets survive coordinator restarts and coordinator-node failover through the replicated coordinator log, but they are still not consensus-backed. Handlers must remain idempotent and operators should not treat consumer-group state as a globally linearizable store.
 - Redirects/retries: on `NotLeader` reconnect to the suggested leader; on `Error("fenced")` refresh metadata/epochs.
 - Security: when auth is enabled, all requests must include a token in `auth`; quotas cap bytes over 1s windows.
 
@@ -199,7 +203,7 @@ Tokens must be supplied in `auth` when auth is enabled. With `RK_REQUIRE_AUTH=tr
 - Produce/fetch errors: on `NotLeader` update metadata; on `acks not satisfied` fix replicas or lower acks; on `fenced` ensure epochs are current and only one leader exists.
 
 ## SDK
-See [src/sdk.rs](src/sdk.rs) for an async client that performs handshake, produce, fetch, `JoinGroup`, `Heartbeat`, `CommitOffset`, `LeaveGroup`, and `GroupFetch` with optional auth tokens. The SDK also exposes `spawn_group_heartbeats` for a background heartbeat loop on a dedicated connection. For TLS, configure the connector with your CA and SNI domain.
+See [src/sdk.rs](src/sdk.rs) for an async client that performs handshake, produce, fetch, `JoinGroup`, `Heartbeat`, `CommitOffset`, `LeaveGroup`, and `GroupFetch` with optional auth tokens. The SDK also exposes `spawn_group_heartbeats` for a dedicated heartbeat connection and `GroupConsumer`, a higher-level loop that joins a group, keeps heartbeats running in the background, fetches from `leader_hint`, commits processed offsets, and rejoins automatically on rebalance. For TLS, configure the connector with your CA and SNI domain.
 
 ## Next steps
 - Depends on requrements... and testing

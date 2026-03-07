@@ -102,6 +102,32 @@ pub struct LeaveGroupRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConsumerGroupMemberState {
+    pub member_id: String,
+    pub join_seq: u64,
+    pub last_heartbeat_ms: u64,
+    pub partitions: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicatedConsumerGroupState {
+    pub group_id: String,
+    pub topic: String,
+    pub version: u64,
+    pub generation: u64,
+    pub partitions: Vec<u32>,
+    pub committed_offsets: Vec<(u32, Offset)>,
+    pub members: Vec<ConsumerGroupMemberState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicateCoordinatorStateRequest {
+    pub state: ReplicatedConsumerGroupState,
+    #[serde(default)]
+    pub auth: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ValidateGroupFetchRequest {
     pub group_id: String,
     pub topic: String,
@@ -117,6 +143,8 @@ pub struct ConsumerGroupAssignment {
     pub topic: String,
     pub partition: u32,
     pub offset: Offset,
+    #[serde(default)]
+    pub leader_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -132,6 +160,7 @@ pub enum Request {
     GroupFetch(GroupFetchRequest),
     LeaveGroup(LeaveGroupRequest),
     ValidateGroupFetch(ValidateGroupFetchRequest),
+    ReplicateCoordinatorState(ReplicateCoordinatorStateRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -194,6 +223,10 @@ pub enum Response {
         generation: u64,
         topic: String,
         partition: u32,
+    },
+    CoordinatorStateReplicated {
+        group_id: String,
+        version: u64,
     },
 }
 

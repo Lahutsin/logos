@@ -12,8 +12,9 @@ pub mod storage;
 pub use config::Config;
 pub use metadata::Metadata;
 pub use protocol::{
-	CommitOffsetRequest, FetchRequest, GroupFetchRequest, HeartbeatRequest, JoinGroupRequest,
-	LeaveGroupRequest, ProduceRequest, Record, Request, Response,
+	CommitOffsetRequest, ConsumerGroupAssignment, FetchRequest, GroupFetchRequest,
+	HeartbeatRequest, JoinGroupRequest, LeaveGroupRequest, ProduceRequest, Record, Request,
+	Response,
 };
 
 pub type Result<T> = anyhow::Result<T>;

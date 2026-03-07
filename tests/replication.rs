@@ -8,9 +8,13 @@ use logos::broker::Broker;
 use logos::metadata::Metadata;
 use logos::protocol::{self, Record, Request, Response};
 use logos::replication::Replicator;
-use logos::sdk::{spawn_group_heartbeats, Client, GroupHeartbeatConfig};
+use logos::sdk::{
+    spawn_group_heartbeats, Client, GroupConsumer, GroupConsumerAction, GroupConsumerConfig,
+    GroupHeartbeatConfig,
+};
 use logos::security::{Authz, TlsEndpoints};
 use logos::storage::Storage;
+use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -123,7 +127,7 @@ async fn start_node(
         4 * 1024 * 1024,
         3_000,
         15_000,
-    );
+    )?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
@@ -482,22 +486,22 @@ async fn consumer_groups_coordinate_across_partition_leaders() -> Result<()> {
     let node1_storage = open_storage(&tmp.path().join("node-1"))?;
     let node2_storage = open_storage(&tmp.path().join("node-2"))?;
 
-    let node1 = start_node(
+    let mut node1 = Some(start_node(
         "node-1",
         node1_listener,
         &metadata_path,
         node1_storage.clone(),
         2,
     )
-    .await?;
-    let node2 = start_node(
+    .await?);
+    let mut node2 = Some(start_node(
         "node-2",
         node2_listener,
         &metadata_path,
         node2_storage.clone(),
         2,
     )
-    .await?;
+    .await?);
 
     let mut partition0_producer = Client::connect(&node1_addr.to_string()).await?;
     assert!(matches!(
@@ -539,6 +543,8 @@ async fn consumer_groups_coordinate_across_partition_leaders() -> Result<()> {
             assert_eq!(2, assignments.len());
             assert_eq!(0, assignments[0].partition);
             assert_eq!(1, assignments[1].partition);
+            assert!(assignments[0].leader_hint.is_some());
+            assert!(assignments[1].leader_hint.is_some());
             (member_id, generation, heartbeat_interval_ms)
         }
         other => panic!("unexpected join response: {other:?}"),
@@ -596,7 +602,491 @@ async fn consumer_groups_coordinate_across_partition_leaders() -> Result<()> {
         .await?;
     assert!(matches!(left, Response::GroupLeft { .. }));
 
-    node1.stop().await;
-    node2.stop().await;
+    node1.take().expect("node-1 handle").stop().await;
+    node2.take().expect("node-2 handle").stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consumer_group_state_survives_coordinator_restart() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let topic = "jobs-restart";
+
+    let node1_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let node2_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let node1_addr = node1_listener.local_addr()?;
+    let node2_addr = node2_listener.local_addr()?;
+
+    let metadata_path = tmp.path().join("metadata-restart.json");
+    write_partitioned_metadata(
+        &metadata_path,
+        topic,
+        &[(0, "node-1", &["node-2"], 1)],
+        &[
+            ("node-1", node1_addr.to_string()),
+            ("node-2", node2_addr.to_string()),
+        ],
+    )?;
+
+    let node1_storage_path = tmp.path().join("node-1-restart");
+    let node2_storage_path = tmp.path().join("node-2-restart");
+    let node1_storage = open_storage(&node1_storage_path)?;
+    let node2_storage = open_storage(&node2_storage_path)?;
+
+    let mut node1 = Some(start_node(
+        "node-1",
+        node1_listener,
+        &metadata_path,
+        node1_storage.clone(),
+        2,
+    )
+    .await?);
+    let mut node2 = Some(start_node(
+        "node-2",
+        node2_listener,
+        &metadata_path,
+        node2_storage.clone(),
+        2,
+    )
+    .await?);
+
+    let mut producer = Client::connect(&node1_addr.to_string()).await?;
+    assert!(matches!(
+        producer
+            .produce(topic, 0, vec![make_record("job-0", "run-0", 0)], None)
+            .await?,
+        Response::Produced { .. }
+    ));
+
+    let metadata = Metadata::load(Some(&metadata_path), "node-1".to_string())?;
+    let coordinator = metadata
+        .consumer_group_coordinator("workers-restart")
+        .context("coordinator should be present")?;
+    let bootstrap_addr = if coordinator == "node-1" {
+        node2_addr
+    } else {
+        node1_addr
+    };
+
+    let mut client = Client::connect(&bootstrap_addr.to_string()).await?;
+    let joined = client
+        .join_group("workers-restart", topic, None, None)
+        .await?;
+    let (member_id, generation) = match joined {
+        Response::GroupJoined {
+            member_id,
+            generation,
+            assignments,
+            ..
+        } => {
+            assert_eq!(1, assignments.len());
+            assert_eq!(0, assignments[0].offset);
+            (member_id, generation)
+        }
+        other => panic!("unexpected join response: {other:?}"),
+    };
+
+    let fetched = client
+        .group_fetch(
+            "workers-restart",
+            topic,
+            &member_id,
+            generation,
+            0,
+            0,
+            1024,
+            None,
+        )
+        .await?;
+    assert!(matches!(fetched, Response::Fetched { .. }));
+
+    let committed = client
+        .commit_offset("workers-restart", topic, &member_id, generation, 0, 1, None)
+        .await?;
+    assert!(matches!(
+        committed,
+        Response::OffsetCommitted { offset: 1, .. }
+    ));
+
+    if coordinator == "node-1" {
+        node1.take().expect("node-1 handle").stop().await;
+    } else {
+        node2.take().expect("node-2 handle").stop().await;
+    }
+
+    let restarted_listener = TcpListener::bind(
+        if coordinator == "node-1" {
+            node1_addr.to_string()
+        } else {
+            node2_addr.to_string()
+        },
+    )
+    .await?;
+    let restarted_storage = if coordinator == "node-1" {
+        open_storage(&node1_storage_path)?
+    } else {
+        open_storage(&node2_storage_path)?
+    };
+    let restarted = start_node(
+        &coordinator,
+        restarted_listener,
+        &metadata_path,
+        restarted_storage,
+        2,
+    )
+    .await?;
+
+    let rejoined = client
+        .join_group("workers-restart", topic, Some(member_id.clone()), None)
+        .await?;
+    match rejoined {
+        Response::GroupJoined {
+            member_id: rejoined_member,
+            generation: rejoined_generation,
+            assignments,
+            ..
+        } => {
+            assert_eq!(member_id, rejoined_member);
+            assert_eq!(generation, rejoined_generation);
+            assert_eq!(1, assignments.len());
+            assert_eq!(1, assignments[0].offset);
+        }
+        other => panic!("unexpected rejoin response after restart: {other:?}"),
+    }
+
+    restarted.stop().await;
+    if coordinator == "node-1" {
+        node2.take().expect("node-2 handle").stop().await;
+    } else {
+        node1.take().expect("node-1 handle").stop().await;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consumer_group_state_fails_over_to_new_coordinator_from_replicated_log() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let topic = "jobs-failover";
+
+    let node1_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let node2_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let node1_addr = node1_listener.local_addr()?;
+    let node2_addr = node2_listener.local_addr()?;
+
+    let metadata_path = tmp.path().join("metadata-failover-cluster.json");
+    write_partitioned_metadata(
+        &metadata_path,
+        topic,
+        &[(0, "node-1", &["node-2"], 1)],
+        &[
+            ("node-1", node1_addr.to_string()),
+            ("node-2", node2_addr.to_string()),
+        ],
+    )?;
+
+    let node1_storage_path = tmp.path().join("node-1-failover");
+    let node2_storage_path = tmp.path().join("node-2-failover");
+    let node1_storage = open_storage(&node1_storage_path)?;
+    let node2_storage = open_storage(&node2_storage_path)?;
+
+    let mut node1 = Some(start_node(
+        "node-1",
+        node1_listener,
+        &metadata_path,
+        node1_storage.clone(),
+        2,
+    )
+    .await?);
+    let mut node2 = Some(start_node(
+        "node-2",
+        node2_listener,
+        &metadata_path,
+        node2_storage.clone(),
+        2,
+    )
+    .await?);
+
+    let mut producer = Client::connect(&node1_addr.to_string()).await?;
+    assert!(matches!(
+        producer
+            .produce(topic, 0, vec![make_record("job-0", "run-0", 0)], None)
+            .await?,
+        Response::Produced { acks: 2, .. }
+    ));
+
+    let metadata = Metadata::load(Some(&metadata_path), "node-1".to_string())?;
+    let coordinator = metadata
+        .consumer_group_coordinator("workers-failover")
+        .context("coordinator should be present")?;
+    let bootstrap_addr = if coordinator == "node-1" {
+        node2_addr
+    } else {
+        node1_addr
+    };
+
+    let mut client = Client::connect(&bootstrap_addr.to_string()).await?;
+    let joined = client
+        .join_group("workers-failover", topic, None, None)
+        .await?;
+    let (member_id, generation) = match joined {
+        Response::GroupJoined {
+            member_id,
+            generation,
+            assignments,
+            ..
+        } => {
+            assert_eq!(1, assignments.len());
+            assert_eq!(0, assignments[0].offset);
+            (member_id, generation)
+        }
+        other => panic!("unexpected join response: {other:?}"),
+    };
+
+    let fetched = client
+        .group_fetch(
+            "workers-failover",
+            topic,
+            &member_id,
+            generation,
+            0,
+            0,
+            1024,
+            None,
+        )
+        .await?;
+    assert!(matches!(fetched, Response::Fetched { .. }));
+
+    let committed = client
+        .commit_offset(
+            "workers-failover",
+            topic,
+            &member_id,
+            generation,
+            0,
+            1,
+            None,
+        )
+        .await?;
+    assert!(matches!(
+        committed,
+        Response::OffsetCommitted { offset: 1, .. }
+    ));
+
+    node1.take().expect("node-1 handle").stop().await;
+    node2.take().expect("node-2 handle").stop().await;
+
+    let (survivor_id, survivor_addr, survivor_storage_path) = if coordinator == "node-1" {
+        ("node-2", node2_addr, node2_storage_path)
+    } else {
+        ("node-1", node1_addr, node1_storage_path)
+    };
+
+    let failover_metadata_path = tmp.path().join("metadata-failover-survivor.json");
+    write_partitioned_metadata(
+        &failover_metadata_path,
+        topic,
+        &[(0, survivor_id, &[], 2)],
+        &[(survivor_id, survivor_addr.to_string())],
+    )?;
+
+    let restarted_listener = TcpListener::bind(survivor_addr.to_string()).await?;
+    let restarted_storage = open_storage(&survivor_storage_path)?;
+    let restarted = start_node(
+        survivor_id,
+        restarted_listener,
+        &failover_metadata_path,
+        restarted_storage,
+        1,
+    )
+    .await?;
+
+    let mut failover_client = Client::connect(&survivor_addr.to_string()).await?;
+    let rejoined = failover_client
+        .join_group(
+            "workers-failover",
+            topic,
+            Some(member_id.clone()),
+            None,
+        )
+        .await?;
+    match rejoined {
+        Response::GroupJoined {
+            member_id: rejoined_member,
+            generation: rejoined_generation,
+            assignments,
+            ..
+        } => {
+            assert_eq!(member_id, rejoined_member);
+            assert_eq!(generation, rejoined_generation);
+            assert_eq!(1, assignments.len());
+            assert_eq!(1, assignments[0].offset);
+        }
+        other => panic!("unexpected failover join response: {other:?}"),
+    }
+
+    restarted.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sdk_group_consumer_rejoins_and_commits_offsets() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let topic = "sdk-group-consumer";
+
+    let node1_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let node2_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let node1_addr = node1_listener.local_addr()?;
+    let node2_addr = node2_listener.local_addr()?;
+
+    let metadata_path = tmp.path().join("metadata-sdk-consumer.json");
+    write_partitioned_metadata(
+        &metadata_path,
+        topic,
+        &[(0, "node-1", &["node-2"], 1)],
+        &[
+            ("node-1", node1_addr.to_string()),
+            ("node-2", node2_addr.to_string()),
+        ],
+    )?;
+
+    let node1_storage = open_storage(&tmp.path().join("node-1-sdk"))?;
+    let node2_storage = open_storage(&tmp.path().join("node-2-sdk"))?;
+
+    let mut node1 = Some(start_node(
+        "node-1",
+        node1_listener,
+        &metadata_path,
+        node1_storage.clone(),
+        2,
+    )
+    .await?);
+    let mut node2 = Some(start_node(
+        "node-2",
+        node2_listener,
+        &metadata_path,
+        node2_storage.clone(),
+        2,
+    )
+    .await?);
+
+    let mut producer = Client::connect(&node1_addr.to_string()).await?;
+    assert!(matches!(
+        producer
+            .produce(topic, 0, vec![make_record("job-0", "run-0", 0)], None)
+            .await?,
+        Response::Produced { acks: 2, .. }
+    ));
+
+    let metadata = Metadata::load(Some(&metadata_path), "node-1".to_string())?;
+    let coordinator = metadata
+        .consumer_group_coordinator("sdk-workers")
+        .context("coordinator should be present")?;
+    let bootstrap_addr = if coordinator == "node-1" {
+        node2_addr
+    } else {
+        node1_addr
+    };
+
+    let consumed = Arc::new(Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
+    let (first_message_tx, first_message_rx) = oneshot::channel();
+    let first_message_signal = Arc::new(Mutex::new(Some(first_message_tx)));
+
+    let consumed_clone = consumed.clone();
+    let first_message_signal_clone = first_message_signal.clone();
+    let mut consumer = GroupConsumer::connect(GroupConsumerConfig {
+        bootstrap_addr: bootstrap_addr.to_string(),
+        group_id: "sdk-workers".to_string(),
+        topic: topic.to_string(),
+        auth: None,
+        fetch_max_bytes: 1024 * 1024,
+        idle_backoff: Duration::from_millis(20),
+    })
+    .await?;
+
+    let consumer_task = tokio::spawn(async move {
+        consumer
+            .run(|message| {
+                let consumed = consumed_clone.clone();
+                let first_message_signal = first_message_signal_clone.clone();
+                async move {
+                    let mut guard = consumed.lock();
+                    guard.push((message.generation, message.record.value.clone()));
+                    let seen = guard.len();
+                    drop(guard);
+
+                    if seen == 1 {
+                        if let Some(tx) = first_message_signal.lock().take() {
+                            let _ = tx.send(());
+                        }
+                    }
+
+                    if seen >= 2 {
+                        Ok(GroupConsumerAction::Stop)
+                    } else {
+                        Ok(GroupConsumerAction::Continue)
+                    }
+                }
+            })
+            .await
+    });
+
+    first_message_rx.await?;
+
+    let mut competing_client = Client::connect(&bootstrap_addr.to_string()).await?;
+    let competing_join = competing_client
+        .join_group("sdk-workers", topic, None, None)
+        .await?;
+    let competing_member_id = match competing_join {
+        Response::GroupJoined {
+            member_id,
+            assignments,
+            ..
+        } => {
+            assert!(assignments.is_empty());
+            member_id
+        }
+        other => panic!("unexpected competing join response: {other:?}"),
+    };
+
+    sleep(Duration::from_millis(75)).await;
+
+    assert!(matches!(
+        producer
+            .produce(topic, 0, vec![make_record("job-1", "run-1", 1)], None)
+            .await?,
+        Response::Produced { acks: 2, .. }
+    ));
+
+    consumer_task.await??;
+
+    let consumed_messages = consumed.lock().clone();
+    assert_eq!(2, consumed_messages.len());
+    assert_eq!(b"run-0".to_vec(), consumed_messages[0].1);
+    assert_eq!(b"run-1".to_vec(), consumed_messages[1].1);
+    assert!(consumed_messages[1].0 > consumed_messages[0].0);
+
+    let refreshed_competing = competing_client
+        .join_group(
+            "sdk-workers",
+            topic,
+            Some(competing_member_id.clone()),
+            None,
+        )
+        .await?;
+    match refreshed_competing {
+        Response::GroupJoined {
+            member_id,
+            assignments,
+            ..
+        } => {
+            assert_eq!(competing_member_id, member_id);
+            assert_eq!(1, assignments.len());
+            assert_eq!(2, assignments[0].offset);
+        }
+        other => panic!("unexpected refreshed competing join response: {other:?}"),
+    }
+
+    node1.take().expect("node-1 handle").stop().await;
+    node2.take().expect("node-2 handle").stop().await;
     Ok(())
 }

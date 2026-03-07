@@ -243,6 +243,13 @@ impl Storage {
         partitions
     }
 
+    pub fn consumer_group_log_path(&self) -> PathBuf {
+        self.inner
+            .root
+            .join("__logos_internal")
+            .join("consumer-groups.log")
+    }
+
     pub async fn compact_async(&self, topic: &str, partition: u32) -> StorageResult<()> {
         let topic = topic.to_string();
         let this = self.clone();
