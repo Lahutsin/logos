@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -110,6 +111,51 @@ impl Metadata {
         })
     }
 
+    pub fn partitions_for_topic(&self, topic: &str) -> Vec<u32> {
+        self.with_state(|s| {
+            let mut partitions: Vec<u32> = s
+                .topics
+                .get(topic)
+                .map(|parts| parts.keys().copied().collect())
+                .unwrap_or_default();
+            partitions.sort_unstable();
+            partitions
+        })
+    }
+
+    pub fn leaders_for_topic(&self, topic: &str) -> Vec<String> {
+        self.with_state(|s| {
+            let mut leaders: Vec<String> = s
+                .topics
+                .get(topic)
+                .map(|parts| parts.values().map(|assignment| assignment.leader.clone()).collect())
+                .unwrap_or_default();
+            leaders.sort();
+            leaders.dedup();
+            leaders
+        })
+    }
+
+    pub fn node_ids(&self) -> Vec<String> {
+        self.with_state(|s| {
+            let mut nodes: Vec<String> = s.nodes.keys().cloned().collect();
+            nodes.sort();
+            nodes
+        })
+    }
+
+    pub fn consumer_group_coordinator(&self, group_id: &str) -> Option<String> {
+        let nodes = self.node_ids();
+        if nodes.is_empty() {
+            return None;
+        }
+
+        let mut hasher = StableHasher::default();
+        hasher.write(group_id.as_bytes());
+        let index = (hasher.finish() as usize) % nodes.len();
+        nodes.get(index).cloned()
+    }
+
     pub fn address(&self, node_id: &str) -> Option<String> {
         self.with_state(|s| s.nodes.get(node_id).cloned())
     }
@@ -170,6 +216,34 @@ impl Metadata {
     }
 }
 
+#[derive(Default)]
+struct StableHasher(u64);
+
+impl Hasher for StableHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = if self.0 == 0 {
+            0xcbf29ce484222325
+        } else {
+            self.0
+        };
+
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+
+        self.0 = hash;
+    }
+
+    fn finish(&self) -> u64 {
+        if self.0 == 0 {
+            0xcbf29ce484222325
+        } else {
+            self.0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +280,14 @@ mod tests {
     fn unknown_partition_is_local_leader_in_single_node_mode() {
         let metadata = Metadata::single_node("node-1".to_string());
         assert!(metadata.is_local_leader("any-topic", 0));
+    }
+
+    #[test]
+    fn consumer_group_coordinator_is_stable() {
+        let metadata = Metadata::single_node("node-1".to_string());
+        assert_eq!(
+            Some("node-1".to_string()),
+            metadata.consumer_group_coordinator("workers")
+        );
     }
 }

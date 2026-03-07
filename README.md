@@ -51,6 +51,8 @@ This disables auth/TLS so you can replay the fixture frames in `tests/fixtures/v
 | `RK_REPLICATION_TIMEOUT_MS` | `1000` | Timeout for each replication attempt in milliseconds. |
 | `RK_REPLICATION_RETRIES` | `2` | Number of replication retries per follower. |
 | `RK_REPLICATION_BACKOFF_MS` | `200` | Delay between replication retries in milliseconds. |
+| `RK_CONSUMER_GROUP_HEARTBEAT_MS` | `3000` | Expected heartbeat interval for consumer group members. |
+| `RK_CONSUMER_GROUP_SESSION_TIMEOUT_MS` | `15000` | Member eviction timeout for consumer groups before rebalance. |
 | `RK_REPLICATION_TOKEN` | `unset` | Token used for inter-node replication auth. |
 | `RK_FSYNC` | `true` | Whether writes are fsynced for stronger durability. |
 | `RK_MAX_FRAME_BYTES` | `4194304` | Maximum incoming protocol frame size. |
@@ -75,6 +77,11 @@ Requests:
 - `Produce { topic, partition, records, auth? }`
 - `Fetch { topic, partition, offset, max_bytes, auth? }`
 - `Replicate { leader_id, leader_epoch, topic, partition, entries, auth? }`
+- `JoinGroup { group_id, topic, member_id?, auth? }`
+- `Heartbeat { group_id, topic, member_id, generation, auth? }`
+- `CommitOffset { group_id, topic, member_id, generation, partition, offset, auth? }`
+- `GroupFetch { group_id, topic, member_id, generation, partition, offset, max_bytes, auth? }`
+- `LeaveGroup { group_id, topic, member_id, generation, auth? }`
 - `Health`
 
 `Produce.records` and `Replicate.entries` must be non-empty; the broker rejects empty batches.
@@ -85,6 +92,11 @@ Responses:
 - `Fetched { records: Vec<FetchedRecord> }`
 - `NotLeader { leader: Option<String> }`
 - `Error(String)`
+- `GroupJoined { group_id, member_id, generation, heartbeat_interval_ms, session_timeout_ms, assignments }`
+- `HeartbeatOk { group_id, member_id, generation }`
+- `OffsetCommitted { group_id, member_id, generation, topic, partition, offset }`
+- `RebalanceRequired { group_id, generation }`
+- `GroupLeft { group_id, member_id, generation }`
 
 ## Produce and consume flow
 ```mermaid
@@ -109,9 +121,20 @@ Producer/consumer request loop:
 - Consumer updates its next offset to `last_seen_offset + 1` and repeats fetch.
 - On `NotLeader`, reconnect to the suggested leader and retry produce/fetch on that node.
 
+## Consumer groups
+- Consumer groups are pull-based. Members still fetch explicitly, but the broker now assigns topic partitions to a single member at a time and rejects `GroupFetch`/`CommitOffset` for non-owners.
+- Group lifecycle: `JoinGroup` returns `member_id`, `generation`, heartbeat/session timers, and assigned `{ topic, partition, offset }` tuples. Consumers should fetch from those offsets, commit `last_processed_offset + 1`, keep sending `Heartbeat`, and call `LeaveGroup` during graceful shutdown.
+- Coordinator selection is cluster-wide: every broker hashes `group_id` over the known node IDs and forwards `JoinGroup`, `Heartbeat`, `CommitOffset`, and `LeaveGroup` to the same coordinator node. That gives the cluster one shared in-memory coordinator state per group without requiring all partitions to live on one leader.
+- `GroupFetch` can be sent to any broker that hosts the partition data. If that broker is not the group coordinator, it validates ownership remotely against the coordinator before serving records.
+- If heartbeats stop for longer than `RK_CONSUMER_GROUP_SESSION_TIMEOUT_MS`, the broker evicts that member and rebalances the partitions among the remaining members.
+- On `RebalanceRequired { generation }`, the client must rejoin the group and use the new generation before fetching or committing again.
+- Current limitation: coordinator state is shared logically through the selected coordinator node, but it is still in-memory only. If that node restarts, members must rejoin and any unflushed committed offsets are lost.
+- In single-node mode, if a topic has not been created yet, the coordinator assumes partition `0` for initial assignment so a worker can join before the first produce.
+
 ## Client semantics
 - Producers: with `acks >= 2` the write is confirmed after the leader and at least one follower persist it; ordering is per-partition; no idempotence (retries can duplicate).
 - Fetch: returns bytes on the node you hit; commit watermark is for recovery, not filtering. After compaction, clients can observe sparse offsets and should advance from the last returned offset rather than assuming contiguity. Clients must follow leaders (on `NotLeader`) and de-duplicate during leader changes.
+- Consumer groups: ownership is enforced per partition and generation. Exactly-once delivery is still not provided; consumers should keep handlers idempotent because restarts and rebalances can replay records after the last committed offset.
 - Redirects/retries: on `NotLeader` reconnect to the suggested leader; on `Error("fenced")` refresh metadata/epochs.
 - Security: when auth is enabled, all requests must include a token in `auth`; quotas cap bytes over 1s windows.
 
@@ -176,7 +199,7 @@ Tokens must be supplied in `auth` when auth is enabled. With `RK_REQUIRE_AUTH=tr
 - Produce/fetch errors: on `NotLeader` update metadata; on `acks not satisfied` fix replicas or lower acks; on `fenced` ensure epochs are current and only one leader exists.
 
 ## SDK
-See [src/sdk.rs](src/sdk.rs) for an async client that performs handshake, produce, and fetch with optional auth tokens. For TLS, configure the connector with your CA and SNI domain.
+See [src/sdk.rs](src/sdk.rs) for an async client that performs handshake, produce, fetch, `JoinGroup`, `Heartbeat`, `CommitOffset`, `LeaveGroup`, and `GroupFetch` with optional auth tokens. The SDK also exposes `spawn_group_heartbeats` for a background heartbeat loop on a dedicated connection. For TLS, configure the connector with your CA and SNI domain.
 
 ## Next steps
 - Depends on requrements... and testing

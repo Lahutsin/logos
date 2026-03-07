@@ -18,6 +18,8 @@ pub struct Config {
     pub replication_timeout_ms: u64,
     pub replication_retries: usize,
     pub replication_backoff_ms: u64,
+    pub consumer_group_heartbeat_ms: u64,
+    pub consumer_group_session_timeout_ms: u64,
     pub replication_auth_token: Option<String>,
     pub admin_bind: String,
     pub admin_token: Option<String>,
@@ -92,6 +94,16 @@ impl Config {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(200);
 
+        let consumer_group_heartbeat_ms = env::var("RK_CONSUMER_GROUP_HEARTBEAT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(3_000);
+
+        let consumer_group_session_timeout_ms = env::var("RK_CONSUMER_GROUP_SESSION_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(15_000);
+
         let replication_auth_token = env::var("RK_REPLICATION_TOKEN").ok();
 
         let admin_bind = env::var("RK_ADMIN_ADDR").unwrap_or_else(|_| "127.0.0.1:9100".to_string());
@@ -147,6 +159,8 @@ impl Config {
             replication_timeout_ms,
             replication_retries,
             replication_backoff_ms,
+            consumer_group_heartbeat_ms,
+            consumer_group_session_timeout_ms,
             replication_auth_token,
             admin_bind,
             admin_token,

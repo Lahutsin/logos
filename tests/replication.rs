@@ -8,13 +8,14 @@ use logos::broker::Broker;
 use logos::metadata::Metadata;
 use logos::protocol::{self, Record, Request, Response};
 use logos::replication::Replicator;
-use logos::sdk::Client;
+use logos::sdk::{spawn_group_heartbeats, Client, GroupHeartbeatConfig};
 use logos::security::{Authz, TlsEndpoints};
 use logos::storage::Storage;
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tokio::time::{sleep, Duration};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 struct ServerHandle {
@@ -51,20 +52,36 @@ fn write_metadata(
     epoch: u64,
     nodes: &[(&str, String)],
 ) -> Result<()> {
+    write_partitioned_metadata(
+        path,
+        topic,
+        &[(0, leader, followers, epoch)],
+        nodes,
+    )
+}
+
+fn write_partitioned_metadata(
+    path: &Path,
+    topic: &str,
+    partitions_def: &[(u32, &str, &[&str], u64)],
+    nodes: &[(&str, String)],
+) -> Result<()> {
     let mut nodes_obj = serde_json::Map::new();
     for (id, addr) in nodes {
         nodes_obj.insert((*id).to_string(), Value::String(addr.clone()));
     }
 
     let mut partitions = serde_json::Map::new();
-    partitions.insert(
-        "0".to_string(),
-        serde_json::json!({
-            "leader": leader,
-            "followers": followers,
-            "epoch": epoch,
-        }),
-    );
+    for (partition, leader, followers, epoch) in partitions_def {
+        partitions.insert(
+            partition.to_string(),
+            serde_json::json!({
+                "leader": leader,
+                "followers": followers,
+                "epoch": epoch,
+            }),
+        );
+    }
 
     let mut topics = serde_json::Map::new();
     topics.insert(topic.to_string(), Value::Object(partitions));
@@ -104,6 +121,8 @@ async fn start_node(
         ack_quorum,
         authz,
         4 * 1024 * 1024,
+        3_000,
+        15_000,
     );
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -433,5 +452,151 @@ async fn replication_recovers_after_leader_change_and_redelivery() -> Result<()>
 
     new_leader.stop().await;
     new_follower.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consumer_groups_coordinate_across_partition_leaders() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let topic = "jobs";
+
+    let node1_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let node2_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let node1_addr = node1_listener.local_addr()?;
+    let node2_addr = node2_listener.local_addr()?;
+
+    let metadata_path = tmp.path().join("metadata-groups.json");
+    write_partitioned_metadata(
+        &metadata_path,
+        topic,
+        &[
+            (0, "node-1", &["node-2"], 1),
+            (1, "node-2", &["node-1"], 1),
+        ],
+        &[
+            ("node-1", node1_addr.to_string()),
+            ("node-2", node2_addr.to_string()),
+        ],
+    )?;
+
+    let node1_storage = open_storage(&tmp.path().join("node-1"))?;
+    let node2_storage = open_storage(&tmp.path().join("node-2"))?;
+
+    let node1 = start_node(
+        "node-1",
+        node1_listener,
+        &metadata_path,
+        node1_storage.clone(),
+        2,
+    )
+    .await?;
+    let node2 = start_node(
+        "node-2",
+        node2_listener,
+        &metadata_path,
+        node2_storage.clone(),
+        2,
+    )
+    .await?;
+
+    let mut partition0_producer = Client::connect(&node1_addr.to_string()).await?;
+    assert!(matches!(
+        partition0_producer
+            .produce(topic, 0, vec![make_record("job-0", "run-0", 0)], None)
+            .await?,
+        Response::Produced { acks: 2, .. }
+    ));
+
+    let mut partition1_producer = Client::connect(&node2_addr.to_string()).await?;
+    assert!(matches!(
+        partition1_producer
+            .produce(topic, 1, vec![make_record("job-1", "run-1", 1)], None)
+            .await?,
+        Response::Produced { acks: 2, .. }
+    ));
+
+    let metadata = Metadata::load(Some(&metadata_path), "node-1".to_string())?;
+    let coordinator = metadata
+        .consumer_group_coordinator("workers")
+        .context("coordinator should be present")?;
+
+    let (bootstrap_addr, fetch_addr) = if coordinator == "node-1" {
+        (node2_addr, node2_addr)
+    } else {
+        (node1_addr, node1_addr)
+    };
+
+    let mut consumer = Client::connect(&bootstrap_addr.to_string()).await?;
+    let joined = consumer.join_group("workers", topic, None, None).await?;
+    let (member_id, generation, heartbeat_interval_ms) = match joined {
+        Response::GroupJoined {
+            member_id,
+            generation,
+            heartbeat_interval_ms,
+            assignments,
+            ..
+        } => {
+            assert_eq!(2, assignments.len());
+            assert_eq!(0, assignments[0].partition);
+            assert_eq!(1, assignments[1].partition);
+            (member_id, generation, heartbeat_interval_ms)
+        }
+        other => panic!("unexpected join response: {other:?}"),
+    };
+
+    let heartbeat_handle = spawn_group_heartbeats(GroupHeartbeatConfig {
+        addr: bootstrap_addr.to_string(),
+        group_id: "workers".to_string(),
+        topic: topic.to_string(),
+        member_id: member_id.clone(),
+        generation,
+        interval: Duration::from_millis((heartbeat_interval_ms / 4).max(50)),
+        auth: None,
+    });
+
+    sleep(Duration::from_millis(150)).await;
+
+    let mut group_fetch_client = Client::connect(&fetch_addr.to_string()).await?;
+    for partition in [0u32, 1u32] {
+        let response = group_fetch_client
+            .group_fetch(
+                "workers",
+                topic,
+                &member_id,
+                generation,
+                partition,
+                0,
+                1024 * 1024,
+                None,
+            )
+            .await?;
+
+        match response {
+            Response::Fetched { records } => {
+                assert_eq!(1, records.len());
+                assert_eq!(0, records[0].offset);
+            }
+            other => panic!("unexpected group fetch response: {other:?}"),
+        }
+
+        let commit = group_fetch_client
+            .commit_offset("workers", topic, &member_id, generation, partition, 1, None)
+            .await?;
+        assert!(matches!(
+            commit,
+            Response::OffsetCommitted { partition: committed_partition, offset, .. }
+                if committed_partition == partition && offset == 1
+        ));
+    }
+
+    heartbeat_handle.stop().await?;
+
+    let left = consumer
+        .leave_group("workers", topic, &member_id, generation, None)
+        .await?;
+    assert!(matches!(left, Response::GroupLeft { .. }));
+
+    node1.stop().await;
+    node2.stop().await;
     Ok(())
 }

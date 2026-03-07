@@ -57,6 +57,22 @@ impl Replicator {
         }
     }
 
+    pub fn internal_auth_token(&self) -> Option<String> {
+        self.auth_token.clone()
+    }
+
+    pub async fn send_request_to_node(
+        &self,
+        node_id: &str,
+        request: Request,
+    ) -> anyhow::Result<Response> {
+        let addr = self
+            .metadata
+            .address(node_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown peer '{node_id}'"))?;
+        send_request_once(addr, request, self.timeout, self.tls.clone()).await
+    }
+
     /// Replicate batch to followers and wait for acknowledgements.
     /// Returns the number of follower acknowledgements (caller adds local write).
     pub async fn replicate(
@@ -109,6 +125,35 @@ async fn replicate_once(
 ) -> bool {
     let peer = peer_id.clone();
 
+    match send_request_once(addr, Request::Replicate(req), timeout, tls).await {
+        Ok(Response::Produced { .. }) => true,
+        Ok(Response::NotLeader { leader }) => {
+            inc_request("replicate", "not_leader");
+            warn!(?leader, peer=%peer, "peer rejected replicate: not leader");
+            false
+        }
+        Ok(Response::Error(err)) => {
+            inc_request("replicate", "error");
+            warn!(error=%err, peer=%peer, "peer replication error");
+            false
+        }
+        Ok(other) => {
+            warn!(peer=%peer, response=?other, "unexpected replication response");
+            false
+        }
+        Err(err) => {
+            warn!(%err, peer=%peer_id, "replication failed");
+            false
+        }
+    }
+}
+
+async fn send_request_once(
+    addr: String,
+    request: Request,
+    timeout: Duration,
+    tls: TlsEndpoints,
+) -> anyhow::Result<Response> {
     let action = async move {
         let tcp = TcpStream::connect(&addr).await?;
         let codec = LengthDelimitedCodec::builder()
@@ -121,62 +166,40 @@ async fn replicate_once(
             })?;
             let tls_stream = connector.connect(name, tcp).await?;
             let mut framed = Framed::new(tls_stream, codec);
-            perform_handshake(&mut framed).await?;
-            let payload = protocol::encode(&Request::Replicate(req.clone()))?;
-            framed.send(Bytes::from(payload)).await?;
-            if let Some(frame) = framed.next().await.transpose()? {
-                let response: Response = protocol::decode(&frame)?;
-                match response {
-                    Response::Produced { .. } => return Ok::<bool, anyhow::Error>(true),
-                    Response::NotLeader { leader } => {
-                        inc_request("replicate", "not_leader");
-                        warn!(?leader, peer=%peer, "peer rejected replicate: not leader");
-                    }
-                    Response::Error(err) => {
-                        inc_request("replicate", "error");
-                        warn!(error=%err, peer=%peer, "peer replication error");
-                    }
-                    _ => {
-                        warn!(peer=%peer, "unexpected replication response");
-                    }
-                }
-            }
+            send_request_over_framed(&mut framed, request).await
         } else {
             let mut framed = Framed::new(tcp, codec);
-            perform_handshake(&mut framed).await?;
-            let payload = protocol::encode(&Request::Replicate(req))?;
-            framed.send(Bytes::from(payload)).await?;
-            if let Some(frame) = framed.next().await.transpose()? {
-                let response: Response = protocol::decode(&frame)?;
-                match response {
-                    Response::Produced { .. } => return Ok::<bool, anyhow::Error>(true),
-                    Response::NotLeader { leader } => {
-                        warn!(?leader, peer=%peer, "peer rejected replicate: not leader");
-                    }
-                    Response::Error(err) => {
-                        warn!(error=%err, peer=%peer, "peer replication error");
-                    }
-                    _ => {
-                        warn!(peer=%peer, "unexpected replication response");
-                    }
-                }
-            }
+            send_request_over_framed(&mut framed, request).await
         }
-
-        Ok::<bool, anyhow::Error>(false)
     };
 
-    match time::timeout(timeout, action).await {
-        Ok(Ok(ok)) => ok,
-        Ok(Err(err)) => {
-            warn!(%err, peer=%peer_id, "replication failed");
-            false
-        }
-        Err(_) => {
-            warn!(peer=%peer_id, "replication timed out");
-            false
-        }
+    if timeout.is_zero() {
+        return action.await;
     }
+
+    match time::timeout(timeout, action).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!("request to peer timed out")),
+    }
+}
+
+async fn send_request_over_framed<S>(
+    framed: &mut Framed<S, LengthDelimitedCodec>,
+    request: Request,
+) -> anyhow::Result<Response>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    perform_handshake(framed).await?;
+    let payload = protocol::encode(&request)?;
+    framed.send(Bytes::from(payload)).await?;
+    let frame = framed
+        .next()
+        .await
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("peer closed connection before responding"))?;
+    let response: Response = protocol::decode(&frame)?;
+    Ok(response)
 }
 
 async fn perform_handshake<S>(framed: &mut Framed<S, LengthDelimitedCodec>) -> anyhow::Result<()>

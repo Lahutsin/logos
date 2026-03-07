@@ -229,6 +229,20 @@ impl Storage {
         guard.fetch(offset, max_bytes)
     }
 
+    pub fn partitions_for_topic(&self, topic: &str) -> Vec<u32> {
+        let mut partitions: Vec<u32> = self
+            .inner
+            .logs
+            .read()
+            .keys()
+            .filter(|key| key.topic == topic)
+            .map(|key| key.partition)
+            .collect();
+        partitions.sort_unstable();
+        partitions.dedup();
+        partitions
+    }
+
     pub async fn compact_async(&self, topic: &str, partition: u32) -> StorageResult<()> {
         let topic = topic.to_string();
         let this = self.clone();

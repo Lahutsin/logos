@@ -127,6 +127,8 @@ async fn main() -> anyhow::Result<()> {
         config.replication_ack_quorum,
         authz,
         config.max_batch_bytes,
+        config.consumer_group_heartbeat_ms,
+        config.consumer_group_session_timeout_ms,
     );
 
     run_server(config, broker, tls, storage, admin_addr).await
