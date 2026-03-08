@@ -128,7 +128,12 @@ impl Metadata {
             let mut leaders: Vec<String> = s
                 .topics
                 .get(topic)
-                .map(|parts| parts.values().map(|assignment| assignment.leader.clone()).collect())
+                .map(|parts| {
+                    parts
+                        .values()
+                        .map(|assignment| assignment.leader.clone())
+                        .collect()
+                })
                 .unwrap_or_default();
             leaders.sort();
             leaders.dedup();

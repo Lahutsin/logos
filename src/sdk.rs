@@ -284,48 +284,13 @@ impl Client {
 
     pub async fn commit_offset(
         &mut self,
-        group_id: &str,
-        topic: &str,
-        member_id: &str,
-        generation: u64,
-        partition: u32,
-        offset: u64,
-        auth: Option<String>,
+        request: CommitOffsetRequest,
     ) -> anyhow::Result<Response> {
-        let req = Request::CommitOffset(CommitOffsetRequest {
-            group_id: group_id.to_string(),
-            topic: topic.to_string(),
-            member_id: member_id.to_string(),
-            generation,
-            partition,
-            offset,
-            auth,
-        });
-        self.send(req).await
+        self.send(Request::CommitOffset(request)).await
     }
 
-    pub async fn group_fetch(
-        &mut self,
-        group_id: &str,
-        topic: &str,
-        member_id: &str,
-        generation: u64,
-        partition: u32,
-        offset: u64,
-        max_bytes: u32,
-        auth: Option<String>,
-    ) -> anyhow::Result<Response> {
-        let req = Request::GroupFetch(GroupFetchRequest {
-            group_id: group_id.to_string(),
-            topic: topic.to_string(),
-            member_id: member_id.to_string(),
-            generation,
-            partition,
-            offset,
-            max_bytes,
-            auth,
-        });
-        self.send(req).await
+    pub async fn group_fetch(&mut self, request: GroupFetchRequest) -> anyhow::Result<Response> {
+        self.send(Request::GroupFetch(request)).await
     }
 
     pub async fn leave_group(
@@ -502,7 +467,8 @@ impl GroupConsumer {
                 self.member_id = Some(member_id.clone());
                 self.generation = generation;
                 self.assignments = assignments;
-                self.assignments.sort_by_key(|assignment| assignment.partition);
+                self.assignments
+                    .sort_by_key(|assignment| assignment.partition);
                 self.next_offsets = self
                     .assignments
                     .iter()
@@ -512,9 +478,7 @@ impl GroupConsumer {
                 self.start_heartbeats(heartbeat_interval_ms, &member_id, generation);
                 Ok(())
             }
-            Response::Error(err) => {
-                Err(anyhow::anyhow!("consumer group join failed: {err}"))
-            }
+            Response::Error(err) => Err(anyhow::anyhow!("consumer group join failed: {err}")),
             other => Err(anyhow::anyhow!(
                 "unexpected join_group response while starting consumer: {other:?}"
             )),
@@ -593,8 +557,7 @@ impl GroupConsumer {
                     return Ok(None);
                 }
                 Response::Error(err)
-                    if err.contains("partition not assigned")
-                        || err.contains("consumer group") =>
+                    if err.contains("partition not assigned") || err.contains("consumer group") =>
                 {
                     self.rejoin().await?;
                     return Ok(None);
@@ -699,10 +662,7 @@ impl GroupConsumer {
         }
     }
 
-    async fn send_join_group(
-        &mut self,
-        member_id: Option<String>,
-    ) -> anyhow::Result<Response> {
+    async fn send_join_group(&mut self, member_id: Option<String>) -> anyhow::Result<Response> {
         match self
             .bootstrap
             .join_group(
@@ -737,30 +697,30 @@ impl GroupConsumer {
     ) -> anyhow::Result<Response> {
         match self
             .bootstrap
-            .commit_offset(
-                &self.config.group_id,
-                &self.config.topic,
-                member_id,
+            .commit_offset(CommitOffsetRequest {
+                group_id: self.config.group_id.clone(),
+                topic: self.config.topic.clone(),
+                member_id: member_id.to_string(),
                 generation,
                 partition,
                 offset,
-                self.config.auth.clone(),
-            )
+                auth: self.config.auth.clone(),
+            })
             .await
         {
             Ok(response) => Ok(response),
             Err(_) => {
                 self.bootstrap = Client::connect(&self.config.bootstrap_addr).await?;
                 self.bootstrap
-                    .commit_offset(
-                        &self.config.group_id,
-                        &self.config.topic,
-                        member_id,
+                    .commit_offset(CommitOffsetRequest {
+                        group_id: self.config.group_id.clone(),
+                        topic: self.config.topic.clone(),
+                        member_id: member_id.to_string(),
                         generation,
                         partition,
                         offset,
-                        self.config.auth.clone(),
-                    )
+                        auth: self.config.auth.clone(),
+                    })
                     .await
             }
         }
@@ -812,16 +772,16 @@ impl GroupConsumer {
         let result = match self.fetch_clients.get_mut(addr) {
             Some(client) => {
                 client
-                    .group_fetch(
-                        &self.config.group_id,
-                        &self.config.topic,
-                        self.member_id.as_deref().unwrap_or_default(),
-                        self.generation,
+                    .group_fetch(GroupFetchRequest {
+                        group_id: self.config.group_id.clone(),
+                        topic: self.config.topic.clone(),
+                        member_id: self.member_id.clone().unwrap_or_default(),
+                        generation: self.generation,
                         partition,
                         offset,
-                        self.config.fetch_max_bytes,
-                        self.config.auth.clone(),
-                    )
+                        max_bytes: self.config.fetch_max_bytes,
+                        auth: self.config.auth.clone(),
+                    })
                     .await
             }
             None => anyhow::bail!("fetch client for '{addr}' is unavailable"),
@@ -836,16 +796,16 @@ impl GroupConsumer {
                 self.fetch_clients
                     .get_mut(addr)
                     .expect("fetch client is inserted before retry")
-                    .group_fetch(
-                        &self.config.group_id,
-                        &self.config.topic,
-                        self.member_id.as_deref().unwrap_or_default(),
-                        self.generation,
+                    .group_fetch(GroupFetchRequest {
+                        group_id: self.config.group_id.clone(),
+                        topic: self.config.topic.clone(),
+                        member_id: self.member_id.clone().unwrap_or_default(),
+                        generation: self.generation,
                         partition,
                         offset,
-                        self.config.fetch_max_bytes,
-                        self.config.auth.clone(),
-                    )
+                        max_bytes: self.config.fetch_max_bytes,
+                        auth: self.config.auth.clone(),
+                    })
                     .await
             }
         }

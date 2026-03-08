@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::consumer_group::{ConsumerGroupCoordinator, GroupError};
+use crate::consumer_group::{CommitOffsetInput, ConsumerGroupCoordinator, GroupError};
 use crate::metadata::Metadata;
 use crate::metrics::{add_bytes, inc_request};
 use crate::protocol::{
@@ -12,6 +12,15 @@ use crate::replication::Replicator;
 use crate::security::{Action, Authz};
 use crate::storage::Storage;
 use tracing::error;
+
+#[derive(Clone)]
+pub struct BrokerConfig {
+    pub ack_quorum: usize,
+    pub authz: Authz,
+    pub max_batch_bytes: u64,
+    pub consumer_group_heartbeat_ms: u64,
+    pub consumer_group_session_timeout_ms: u64,
+}
 
 #[derive(Clone)]
 pub struct Broker {
@@ -29,26 +38,22 @@ impl Broker {
         storage: Storage,
         replicator: Replicator,
         metadata: Arc<Metadata>,
-        ack_quorum: usize,
-        authz: Authz,
-        max_batch_bytes: u64,
-        consumer_group_heartbeat_ms: u64,
-        consumer_group_session_timeout_ms: u64,
+        config: BrokerConfig,
     ) -> anyhow::Result<Self> {
         let consumer_groups = ConsumerGroupCoordinator::persistent(
             storage.consumer_group_log_path(),
             metadata.self_id().to_string(),
-            consumer_group_heartbeat_ms,
-            consumer_group_session_timeout_ms,
+            config.consumer_group_heartbeat_ms,
+            config.consumer_group_session_timeout_ms,
         )?;
 
         Ok(Self {
             storage,
             metadata,
-            ack_quorum: ack_quorum.max(1),
+            ack_quorum: config.ack_quorum.max(1),
             replicator,
-            authz,
-            max_batch_bytes,
+            authz: config.authz,
+            max_batch_bytes: config.max_batch_bytes,
             consumer_groups,
         })
     }
@@ -117,10 +122,12 @@ impl Broker {
             .export_group_state(&req.group_id)
             .map(|state| state.version);
 
-        let response = match self
-            .consumer_groups
-            .join(&req.group_id, &req.topic, req.member_id.as_deref(), &partitions)
-        {
+        let response = match self.consumer_groups.join(
+            &req.group_id,
+            &req.topic,
+            req.member_id.as_deref(),
+            &partitions,
+        ) {
             Ok(joined) => {
                 inc_request("join_group", "ok");
                 Response::GroupJoined {
@@ -250,12 +257,14 @@ impl Broker {
             .map(|state| state.version);
 
         let response = match self.consumer_groups.commit_offset(
-            &req.group_id,
-            &req.topic,
-            &req.member_id,
-            req.generation,
-            req.partition,
-            req.offset,
+            CommitOffsetInput {
+                group_id: &req.group_id,
+                topic: &req.topic,
+                member_id: &req.member_id,
+                generation: req.generation,
+                partition: req.partition,
+                offset: req.offset,
+            },
             &partitions,
         ) {
             Ok(outcome) => {
@@ -774,7 +783,11 @@ impl Broker {
             return None;
         }
 
-        match self.replicator.send_request_to_node(&coordinator, request).await {
+        match self
+            .replicator
+            .send_request_to_node(&coordinator, request)
+            .await
+        {
             Ok(response) => {
                 inc_request(metric, "ok");
                 Some(response)
@@ -822,7 +835,11 @@ impl Broker {
             auth: self.replicator.internal_auth_token(),
         });
 
-        match self.replicator.send_request_to_node(&coordinator, validation).await {
+        match self
+            .replicator
+            .send_request_to_node(&coordinator, validation)
+            .await
+        {
             Ok(Response::GroupFetchAuthorized { .. }) => None,
             Ok(response) => Some(response),
             Err(err) => Some(Response::Error(format!(
@@ -844,7 +861,8 @@ impl Broker {
         assignments
             .into_iter()
             .map(|mut assignment| {
-                assignment.leader_hint = self.assignment_leader_hint(&assignment.topic, assignment.partition);
+                assignment.leader_hint =
+                    self.assignment_leader_hint(&assignment.topic, assignment.partition);
                 assignment
             })
             .collect()
@@ -898,9 +916,7 @@ impl Broker {
                 Response::CoordinatorStateReplicated { group_id, version }
                     if group_id == state.group_id && version == state.version => {}
                 Response::Error(err) => {
-                    anyhow::bail!(
-                        "peer '{node_id}' rejected coordinator state replication: {err}"
-                    );
+                    anyhow::bail!("peer '{node_id}' rejected coordinator state replication: {err}");
                 }
                 other => {
                     anyhow::bail!(
@@ -919,8 +935,8 @@ mod tests {
     use super::*;
     use crate::metadata::Metadata;
     use crate::protocol::{
-        CommitOffsetRequest, GroupFetchRequest, JoinGroupRequest, ProduceRequest,
-        ReplicateRequest, Request,
+        CommitOffsetRequest, GroupFetchRequest, JoinGroupRequest, ProduceRequest, ReplicateRequest,
+        Request,
     };
     use crate::replication::Replicator;
     use tempfile::tempdir;
@@ -935,11 +951,13 @@ mod tests {
             storage,
             Replicator::disabled(),
             metadata,
-            1,
-            authz,
-            4 * 1024 * 1024,
-            3_000,
-            15_000,
+            BrokerConfig {
+                ack_quorum: 1,
+                authz,
+                max_batch_bytes: 4 * 1024 * 1024,
+                consumer_group_heartbeat_ms: 3_000,
+                consumer_group_session_timeout_ms: 15_000,
+            },
         )
         .unwrap();
 
@@ -968,11 +986,13 @@ mod tests {
             storage,
             Replicator::disabled(),
             metadata,
-            1,
-            authz,
-            4 * 1024 * 1024,
-            3_000,
-            15_000,
+            BrokerConfig {
+                ack_quorum: 1,
+                authz,
+                max_batch_bytes: 4 * 1024 * 1024,
+                consumer_group_heartbeat_ms: 3_000,
+                consumer_group_session_timeout_ms: 15_000,
+            },
         )
         .unwrap();
 
@@ -1003,11 +1023,13 @@ mod tests {
             storage,
             Replicator::disabled(),
             metadata,
-            1,
-            authz,
-            4 * 1024 * 1024,
-            3_000,
-            15_000,
+            BrokerConfig {
+                ack_quorum: 1,
+                authz,
+                max_batch_bytes: 4 * 1024 * 1024,
+                consumer_group_heartbeat_ms: 3_000,
+                consumer_group_session_timeout_ms: 15_000,
+            },
         )
         .unwrap();
 

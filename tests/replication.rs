@@ -4,9 +4,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use logos::broker::Broker;
+use logos::broker::{Broker, BrokerConfig};
 use logos::metadata::Metadata;
-use logos::protocol::{self, Record, Request, Response};
+use logos::protocol::{self, CommitOffsetRequest, GroupFetchRequest, Record, Request, Response};
 use logos::replication::Replicator;
 use logos::sdk::{
     spawn_group_heartbeats, Client, GroupConsumer, GroupConsumerAction, GroupConsumerConfig,
@@ -56,12 +56,7 @@ fn write_metadata(
     epoch: u64,
     nodes: &[(&str, String)],
 ) -> Result<()> {
-    write_partitioned_metadata(
-        path,
-        topic,
-        &[(0, leader, followers, epoch)],
-        nodes,
-    )
+    write_partitioned_metadata(path, topic, &[(0, leader, followers, epoch)], nodes)
 }
 
 fn write_partitioned_metadata(
@@ -122,11 +117,13 @@ async fn start_node(
         storage,
         replicator,
         metadata,
-        ack_quorum,
-        authz,
-        4 * 1024 * 1024,
-        3_000,
-        15_000,
+        BrokerConfig {
+            ack_quorum,
+            authz,
+            max_batch_bytes: 4 * 1024 * 1024,
+            consumer_group_heartbeat_ms: 3_000,
+            consumer_group_session_timeout_ms: 15_000,
+        },
     )?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -473,10 +470,7 @@ async fn consumer_groups_coordinate_across_partition_leaders() -> Result<()> {
     write_partitioned_metadata(
         &metadata_path,
         topic,
-        &[
-            (0, "node-1", &["node-2"], 1),
-            (1, "node-2", &["node-1"], 1),
-        ],
+        &[(0, "node-1", &["node-2"], 1), (1, "node-2", &["node-1"], 1)],
         &[
             ("node-1", node1_addr.to_string()),
             ("node-2", node2_addr.to_string()),
@@ -486,22 +480,26 @@ async fn consumer_groups_coordinate_across_partition_leaders() -> Result<()> {
     let node1_storage = open_storage(&tmp.path().join("node-1"))?;
     let node2_storage = open_storage(&tmp.path().join("node-2"))?;
 
-    let mut node1 = Some(start_node(
-        "node-1",
-        node1_listener,
-        &metadata_path,
-        node1_storage.clone(),
-        2,
-    )
-    .await?);
-    let mut node2 = Some(start_node(
-        "node-2",
-        node2_listener,
-        &metadata_path,
-        node2_storage.clone(),
-        2,
-    )
-    .await?);
+    let mut node1 = Some(
+        start_node(
+            "node-1",
+            node1_listener,
+            &metadata_path,
+            node1_storage.clone(),
+            2,
+        )
+        .await?,
+    );
+    let mut node2 = Some(
+        start_node(
+            "node-2",
+            node2_listener,
+            &metadata_path,
+            node2_storage.clone(),
+            2,
+        )
+        .await?,
+    );
 
     let mut partition0_producer = Client::connect(&node1_addr.to_string()).await?;
     assert!(matches!(
@@ -565,16 +563,16 @@ async fn consumer_groups_coordinate_across_partition_leaders() -> Result<()> {
     let mut group_fetch_client = Client::connect(&fetch_addr.to_string()).await?;
     for partition in [0u32, 1u32] {
         let response = group_fetch_client
-            .group_fetch(
-                "workers",
-                topic,
-                &member_id,
+            .group_fetch(GroupFetchRequest {
+                group_id: "workers".to_string(),
+                topic: topic.to_string(),
+                member_id: member_id.clone(),
                 generation,
                 partition,
-                0,
-                1024 * 1024,
-                None,
-            )
+                offset: 0,
+                max_bytes: 1024 * 1024,
+                auth: None,
+            })
             .await?;
 
         match response {
@@ -586,7 +584,15 @@ async fn consumer_groups_coordinate_across_partition_leaders() -> Result<()> {
         }
 
         let commit = group_fetch_client
-            .commit_offset("workers", topic, &member_id, generation, partition, 1, None)
+            .commit_offset(CommitOffsetRequest {
+                group_id: "workers".to_string(),
+                topic: topic.to_string(),
+                member_id: member_id.clone(),
+                generation,
+                partition,
+                offset: 1,
+                auth: None,
+            })
             .await?;
         assert!(matches!(
             commit,
@@ -633,22 +639,26 @@ async fn consumer_group_state_survives_coordinator_restart() -> Result<()> {
     let node1_storage = open_storage(&node1_storage_path)?;
     let node2_storage = open_storage(&node2_storage_path)?;
 
-    let mut node1 = Some(start_node(
-        "node-1",
-        node1_listener,
-        &metadata_path,
-        node1_storage.clone(),
-        2,
-    )
-    .await?);
-    let mut node2 = Some(start_node(
-        "node-2",
-        node2_listener,
-        &metadata_path,
-        node2_storage.clone(),
-        2,
-    )
-    .await?);
+    let mut node1 = Some(
+        start_node(
+            "node-1",
+            node1_listener,
+            &metadata_path,
+            node1_storage.clone(),
+            2,
+        )
+        .await?,
+    );
+    let mut node2 = Some(
+        start_node(
+            "node-2",
+            node2_listener,
+            &metadata_path,
+            node2_storage.clone(),
+            2,
+        )
+        .await?,
+    );
 
     let mut producer = Client::connect(&node1_addr.to_string()).await?;
     assert!(matches!(
@@ -687,21 +697,29 @@ async fn consumer_group_state_survives_coordinator_restart() -> Result<()> {
     };
 
     let fetched = client
-        .group_fetch(
-            "workers-restart",
-            topic,
-            &member_id,
+        .group_fetch(GroupFetchRequest {
+            group_id: "workers-restart".to_string(),
+            topic: topic.to_string(),
+            member_id: member_id.clone(),
             generation,
-            0,
-            0,
-            1024,
-            None,
-        )
+            partition: 0,
+            offset: 0,
+            max_bytes: 1024,
+            auth: None,
+        })
         .await?;
     assert!(matches!(fetched, Response::Fetched { .. }));
 
     let committed = client
-        .commit_offset("workers-restart", topic, &member_id, generation, 0, 1, None)
+        .commit_offset(CommitOffsetRequest {
+            group_id: "workers-restart".to_string(),
+            topic: topic.to_string(),
+            member_id: member_id.clone(),
+            generation,
+            partition: 0,
+            offset: 1,
+            auth: None,
+        })
         .await?;
     assert!(matches!(
         committed,
@@ -714,13 +732,11 @@ async fn consumer_group_state_survives_coordinator_restart() -> Result<()> {
         node2.take().expect("node-2 handle").stop().await;
     }
 
-    let restarted_listener = TcpListener::bind(
-        if coordinator == "node-1" {
-            node1_addr.to_string()
-        } else {
-            node2_addr.to_string()
-        },
-    )
+    let restarted_listener = TcpListener::bind(if coordinator == "node-1" {
+        node1_addr.to_string()
+    } else {
+        node2_addr.to_string()
+    })
     .await?;
     let restarted_storage = if coordinator == "node-1" {
         open_storage(&node1_storage_path)?
@@ -789,22 +805,26 @@ async fn consumer_group_state_fails_over_to_new_coordinator_from_replicated_log(
     let node1_storage = open_storage(&node1_storage_path)?;
     let node2_storage = open_storage(&node2_storage_path)?;
 
-    let mut node1 = Some(start_node(
-        "node-1",
-        node1_listener,
-        &metadata_path,
-        node1_storage.clone(),
-        2,
-    )
-    .await?);
-    let mut node2 = Some(start_node(
-        "node-2",
-        node2_listener,
-        &metadata_path,
-        node2_storage.clone(),
-        2,
-    )
-    .await?);
+    let mut node1 = Some(
+        start_node(
+            "node-1",
+            node1_listener,
+            &metadata_path,
+            node1_storage.clone(),
+            2,
+        )
+        .await?,
+    );
+    let mut node2 = Some(
+        start_node(
+            "node-2",
+            node2_listener,
+            &metadata_path,
+            node2_storage.clone(),
+            2,
+        )
+        .await?,
+    );
 
     let mut producer = Client::connect(&node1_addr.to_string()).await?;
     assert!(matches!(
@@ -843,29 +863,29 @@ async fn consumer_group_state_fails_over_to_new_coordinator_from_replicated_log(
     };
 
     let fetched = client
-        .group_fetch(
-            "workers-failover",
-            topic,
-            &member_id,
+        .group_fetch(GroupFetchRequest {
+            group_id: "workers-failover".to_string(),
+            topic: topic.to_string(),
+            member_id: member_id.clone(),
             generation,
-            0,
-            0,
-            1024,
-            None,
-        )
+            partition: 0,
+            offset: 0,
+            max_bytes: 1024,
+            auth: None,
+        })
         .await?;
     assert!(matches!(fetched, Response::Fetched { .. }));
 
     let committed = client
-        .commit_offset(
-            "workers-failover",
-            topic,
-            &member_id,
+        .commit_offset(CommitOffsetRequest {
+            group_id: "workers-failover".to_string(),
+            topic: topic.to_string(),
+            member_id: member_id.clone(),
             generation,
-            0,
-            1,
-            None,
-        )
+            partition: 0,
+            offset: 1,
+            auth: None,
+        })
         .await?;
     assert!(matches!(
         committed,
@@ -902,12 +922,7 @@ async fn consumer_group_state_fails_over_to_new_coordinator_from_replicated_log(
 
     let mut failover_client = Client::connect(&survivor_addr.to_string()).await?;
     let rejoined = failover_client
-        .join_group(
-            "workers-failover",
-            topic,
-            Some(member_id.clone()),
-            None,
-        )
+        .join_group("workers-failover", topic, Some(member_id.clone()), None)
         .await?;
     match rejoined {
         Response::GroupJoined {
@@ -952,22 +967,26 @@ async fn sdk_group_consumer_rejoins_and_commits_offsets() -> Result<()> {
     let node1_storage = open_storage(&tmp.path().join("node-1-sdk"))?;
     let node2_storage = open_storage(&tmp.path().join("node-2-sdk"))?;
 
-    let mut node1 = Some(start_node(
-        "node-1",
-        node1_listener,
-        &metadata_path,
-        node1_storage.clone(),
-        2,
-    )
-    .await?);
-    let mut node2 = Some(start_node(
-        "node-2",
-        node2_listener,
-        &metadata_path,
-        node2_storage.clone(),
-        2,
-    )
-    .await?);
+    let mut node1 = Some(
+        start_node(
+            "node-1",
+            node1_listener,
+            &metadata_path,
+            node1_storage.clone(),
+            2,
+        )
+        .await?,
+    );
+    let mut node2 = Some(
+        start_node(
+            "node-2",
+            node2_listener,
+            &metadata_path,
+            node2_storage.clone(),
+            2,
+        )
+        .await?,
+    );
 
     let mut producer = Client::connect(&node1_addr.to_string()).await?;
     assert!(matches!(

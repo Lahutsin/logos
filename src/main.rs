@@ -12,7 +12,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use logos::broker::Broker;
+use logos::broker::{Broker, BrokerConfig};
 use logos::config::Config;
 use logos::metadata::Metadata;
 use logos::metrics::render_prometheus;
@@ -124,11 +124,13 @@ async fn main() -> anyhow::Result<()> {
         storage.clone(),
         replicator,
         metadata,
-        config.replication_ack_quorum,
-        authz,
-        config.max_batch_bytes,
-        config.consumer_group_heartbeat_ms,
-        config.consumer_group_session_timeout_ms,
+        BrokerConfig {
+            ack_quorum: config.replication_ack_quorum,
+            authz,
+            max_batch_bytes: config.max_batch_bytes,
+            consumer_group_heartbeat_ms: config.consumer_group_heartbeat_ms,
+            consumer_group_session_timeout_ms: config.consumer_group_session_timeout_ms,
+        },
     )?;
 
     run_server(config, broker, tls, storage, admin_addr).await

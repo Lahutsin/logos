@@ -66,6 +66,16 @@ pub struct CommitOffsetOutcome {
     pub offset: Offset,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitOffsetInput<'a> {
+    pub group_id: &'a str,
+    pub topic: &'a str,
+    pub member_id: &'a str,
+    pub generation: u64,
+    pub partition: u32,
+    pub offset: Offset,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaveOutcome {
     pub group_id: String,
@@ -156,20 +166,23 @@ impl ConsumerGroupCoordinator {
         let mut groups = self.inner.groups.lock();
         let desired_partitions = normalize_partitions(partitions);
         let now = now_millis();
-        let group = groups.entry(group_id.to_string()).or_insert_with(|| GroupState {
-            topic: topic.to_string(),
-            generation: 0,
-            version: 0,
-            partitions: Vec::new(),
-            members: HashMap::new(),
-            committed_offsets: HashMap::new(),
-        });
+        let group = groups
+            .entry(group_id.to_string())
+            .or_insert_with(|| GroupState {
+                topic: topic.to_string(),
+                generation: 0,
+                version: 0,
+                partitions: Vec::new(),
+                members: HashMap::new(),
+                committed_offsets: HashMap::new(),
+            });
 
         if group.topic != topic {
             return Err(GroupError::TopicMismatch);
         }
 
-        let mut state_changed = cleanup_group(group, &desired_partitions, now, self.inner.session_timeout);
+        let mut state_changed =
+            cleanup_group(group, &desired_partitions, now, self.inner.session_timeout);
         let mut needs_rebalance = state_changed;
 
         let member_id = if let Some(existing) = member_id {
@@ -316,14 +329,18 @@ impl ConsumerGroupCoordinator {
 
     pub fn commit_offset(
         &self,
-        group_id: &str,
-        topic: &str,
-        member_id: &str,
-        generation: u64,
-        partition: u32,
-        offset: Offset,
+        request: CommitOffsetInput<'_>,
         partitions: &[u32],
     ) -> Result<CommitOffsetOutcome, GroupError> {
+        let CommitOffsetInput {
+            group_id,
+            topic,
+            member_id,
+            generation,
+            partition,
+            offset,
+        } = request;
+
         validate_id(group_id, "group_id")?;
         validate_id(topic, "topic")?;
         validate_id(member_id, "member_id")?;
@@ -548,7 +565,9 @@ impl ConsumerGroupCoordinator {
 
     pub fn export_group_state(&self, group_id: &str) -> Option<ReplicatedConsumerGroupState> {
         let groups = self.inner.groups.lock();
-        groups.get(group_id).map(|group| state_record(group_id, group))
+        groups
+            .get(group_id)
+            .map(|group| state_record(group_id, group))
     }
 
     pub fn apply_replicated_state(
@@ -642,8 +661,8 @@ fn cleanup_group(
 ) -> bool {
     let mut changed = false;
     group.members.retain(|_, member| {
-        let alive = now_ms.saturating_sub(member.last_heartbeat_ms)
-            <= session_timeout.as_millis() as u64;
+        let alive =
+            now_ms.saturating_sub(member.last_heartbeat_ms) <= session_timeout.as_millis() as u64;
         if !alive {
             changed = true;
         }
@@ -899,7 +918,14 @@ mod tests {
         assert!(second.assignments.is_empty());
 
         assert!(coordinator
-            .authorize_fetch("workers", "jobs", &first.member_id, first.generation, 0, &[0])
+            .authorize_fetch(
+                "workers",
+                "jobs",
+                &first.member_id,
+                first.generation,
+                0,
+                &[0]
+            )
             .is_ok());
         assert_eq!(
             Err(GroupError::PartitionNotAssigned),
@@ -956,12 +982,14 @@ mod tests {
 
         let committed = coordinator
             .commit_offset(
-                "workers",
-                "jobs",
-                &joined.member_id,
-                joined.generation,
-                0,
-                10,
+                CommitOffsetInput {
+                    group_id: "workers",
+                    topic: "jobs",
+                    member_id: &joined.member_id,
+                    generation: joined.generation,
+                    partition: 0,
+                    offset: 10,
+                },
                 &[0],
             )
             .unwrap();
@@ -970,12 +998,14 @@ mod tests {
         assert_eq!(
             Err(GroupError::OffsetRegression { current_offset: 10 }),
             coordinator.commit_offset(
-                "workers",
-                "jobs",
-                &joined.member_id,
-                joined.generation,
-                0,
-                9,
+                CommitOffsetInput {
+                    group_id: "workers",
+                    topic: "jobs",
+                    member_id: &joined.member_id,
+                    generation: joined.generation,
+                    partition: 0,
+                    offset: 9,
+                },
                 &[0],
             )
         );
